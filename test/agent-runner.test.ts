@@ -1059,7 +1059,8 @@ describe("agent-runner master tool allowlist", () => {
     expect(tools).toContain("ok_ext");
   });
 
-  it("keeps nested tools unavailable without explicit opt-in", async () => {
+  it("keeps nested delegation tools unavailable without explicit opt-in", async () => {
+    // …but the private todo tool needs no opt-in: self-tracking is not delegation.
     vi.mocked(getConfig).mockReturnValueOnce(makeConfig({ extensions: false }));
     vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig({ extensions: false }));
     vi.mocked(getToolNamesForType).mockReturnValueOnce(BUILTINS_7);
@@ -1068,12 +1069,13 @@ describe("agent-runner master tool allowlist", () => {
 
     await runAgent(ctx, "Explore", "go", {
       pi,
-      nestedRuntime: { manager: {} as any, parentAgentId: "parent", depth: 1 },
+      nestedRuntime: { manager: { getRecord: () => undefined } as any, parentAgentId: "parent", depth: 1 },
     });
 
     expect(createNestedSubagentTools).not.toHaveBeenCalled();
     expect(lastToolsPassed()).not.toContain("Agent");
-    expect(createAgentSession.mock.calls[0][0].customTools).toEqual([]);
+    expect(customToolNames()).toEqual(["subagent_todo"]);
+    expect(lastToolsPassed()).toContain("subagent_todo");
   });
 
   it("injects scoped nested tools for an opted-in non-isolated agent", async () => {
@@ -1084,7 +1086,7 @@ describe("agent-runner master tool allowlist", () => {
     vi.mocked(getToolNamesForType).mockReturnValueOnce(BUILTINS_7);
     const { session } = createSession("OK");
     createAgentSession.mockResolvedValue({ session });
-    const manager = {} as any;
+    const manager = { getRecord: () => undefined } as any;
 
     await runAgent(ctx, "Explore", "go", {
       pi,
@@ -1100,9 +1102,9 @@ describe("agent-runner master tool allowlist", () => {
       configCwd: "/tmp",
     }));
     expect(lastToolsPassed()).toEqual(expect.arrayContaining([
-      "Agent", "get_subagent_result", "steer_subagent",
+      "Agent", "get_subagent_result", "steer_subagent", "subagent_todo",
     ]));
-    expect(createAgentSession.mock.calls[0][0].customTools).toHaveLength(3);
+    expect(createAgentSession.mock.calls[0][0].customTools).toHaveLength(4);
   });
 
   it("keeps opt-in nested tools active UNDER EXTENSIONS despite the EXCLUDED-name collision", async () => {
@@ -1120,16 +1122,16 @@ describe("agent-runner master tool allowlist", () => {
 
     await runAgent(ctx, "Explore", "go", {
       pi,
-      nestedRuntime: { manager: {} as any, parentAgentId: "parent", depth: 1 },
+      nestedRuntime: { manager: { getRecord: () => undefined } as any, parentAgentId: "parent", depth: 1 },
     });
 
     const opts = createAgentSession.mock.calls[0][0];
     // (a) not denied at the registry gate, and passed as customTools.
     expect(opts.excludeTools ?? []).not.toContain("Agent");
-    expect(opts.customTools).toHaveLength(3);
+    expect(opts.customTools).toHaveLength(4);
     // (b) survive the active-set renarrow alongside a real extension tool.
     const active = lastToolsPassed();
-    expect(active).toEqual(expect.arrayContaining(["Agent", "get_subagent_result", "steer_subagent"]));
+    expect(active).toEqual(expect.arrayContaining(["Agent", "get_subagent_result", "steer_subagent", "subagent_todo"]));
     expect(active).toContain("ok_ext");
   });
 
@@ -1151,7 +1153,7 @@ describe("agent-runner master tool allowlist", () => {
 
       await runAgent(ctx, "Explore", "go", {
         pi,
-        nestedRuntime: { manager: {} as any, parentAgentId: "parent", depth: 1 },
+        nestedRuntime: { manager: { getRecord: () => undefined } as any, parentAgentId: "parent", depth: 1 },
       });
 
       const tools = lastToolsPassed();
@@ -1172,7 +1174,7 @@ describe("agent-runner master tool allowlist", () => {
 
       await runAgent(ctx, "Explore", "go", {
         pi,
-        nestedRuntime: { manager: {} as any, parentAgentId: "parent", depth: 1 },
+        nestedRuntime: { manager: { getRecord: () => undefined } as any, parentAgentId: "parent", depth: 1 },
       });
 
       expect(createAgentSession.mock.calls[0][0].excludeTools ?? []).toContain("Agent");
@@ -1194,7 +1196,7 @@ describe("agent-runner master tool allowlist", () => {
 
       await runAgent(ctx, "Explore", "go", {
         pi,
-        nestedRuntime: { manager: {} as any, parentAgentId: "parent", depth: 1 },
+        nestedRuntime: { manager: { getRecord: () => undefined } as any, parentAgentId: "parent", depth: 1 },
       });
 
       await expect(
@@ -1204,6 +1206,28 @@ describe("agent-runner master tool allowlist", () => {
       await expect(
         session.agent.beforeToolCall?.({ toolCall: { name: "steer_subagent" } }),
       ).resolves.not.toMatchObject({ block: true });
+    });
+
+    it("lets disallowed_tools opt out of subagent_todo", async () => {
+      // The todo tool rides the same opt-out as the nested delegation tools:
+      // still injected as a customTool, but dropped from the allowlist gate.
+      vi.mocked(getConfig).mockReturnValueOnce(makeConfig({ extensions: false }));
+      vi.mocked(getAgentConfig).mockReturnValueOnce(
+        makeAgentConfig({ extensions: false, allowedSubagents: "all", disallowedTools: ["subagent_todo"] }),
+      );
+      vi.mocked(getToolNamesForType).mockReturnValueOnce(BUILTINS_7);
+      const { session } = createSession("OK");
+      createAgentSession.mockResolvedValue({ session });
+
+      await runAgent(ctx, "Explore", "go", {
+        pi,
+        nestedRuntime: { manager: { getRecord: () => undefined } as any, parentAgentId: "parent", depth: 1 },
+      });
+
+      expect(lastToolsPassed()).not.toContain("subagent_todo");
+      expect(customToolNames()).toContain("subagent_todo");
+      // The delegation opt-in the agent did NOT deny stays available.
+      expect(lastToolsPassed()).toEqual(expect.arrayContaining(["Agent"]));
     });
 
     it("keeps StructuredOutput reachable with no tools: allowlist", async () => {
@@ -1405,7 +1429,7 @@ describe("agent-runner master tool allowlist", () => {
 
       await runAgent(ctx, "Explore", "go", {
         pi,
-        nestedRuntime: { manager: {} as any, parentAgentId: "parent", depth: 1, maxSubagentDepth: 3 },
+        nestedRuntime: { manager: { getRecord: () => undefined } as any, parentAgentId: "parent", depth: 1, maxSubagentDepth: 3 },
       });
 
       const tools = lastToolsPassed();
@@ -1446,7 +1470,7 @@ describe("agent-runner master tool allowlist", () => {
     await runAgent(ctx, "Explore", "go", {
       pi,
       isolated: true,
-      nestedRuntime: { manager: {} as any, parentAgentId: "parent", depth: 1 },
+      nestedRuntime: { manager: { getRecord: () => undefined } as any, parentAgentId: "parent", depth: 1 },
     });
 
     expect(createNestedSubagentTools).not.toHaveBeenCalled();
@@ -1464,7 +1488,7 @@ describe("agent-runner master tool allowlist", () => {
     );
     await runAgent(ctx, "Explore", "go", {
       pi,
-      nestedRuntime: { manager: {} as any, parentAgentId: "parent", depth: 1, maxSubagentDepth: 3 },
+      nestedRuntime: { manager: { getRecord: () => undefined } as any, parentAgentId: "parent", depth: 1, maxSubagentDepth: 3 },
     });
     expect(createNestedSubagentTools).toHaveBeenLastCalledWith(expect.objectContaining({ maxSubagentDepth: 3 }));
   });
@@ -1482,7 +1506,7 @@ describe("agent-runner master tool allowlist", () => {
 
     await runAgent(ctx, "Explore", "go", {
       pi,
-      nestedRuntime: { manager: {} as any, parentAgentId: "parent", depth: 1, maxSubagentDepth: 1 },
+      nestedRuntime: { manager: { getRecord: () => undefined } as any, parentAgentId: "parent", depth: 1, maxSubagentDepth: 1 },
     });
 
     expect(createNestedSubagentTools).not.toHaveBeenCalled();

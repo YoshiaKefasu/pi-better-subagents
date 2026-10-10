@@ -381,11 +381,14 @@ describe("ConversationViewer", () => {
       onMode?: (m: any) => void,
       /** Tall enough that the assertion reads the whole transcript, not the scrolled window. */
       rows = 200,
+      resultMode?: "full" | "collapsed",
+      onResult?: (mode: "full" | "collapsed") => void,
     ) {
       return new ConversationViewer(
         mockTui(rows, 80), mockSession(messages), mockRecord({ status: "completed" }), undefined,
         ansiTheme(), vi.fn(), undefined, undefined, undefined, false,
         mode ? () => mode : undefined, onMode,
+        resultMode ? () => resultMode : undefined, onResult,
       );
     }
 
@@ -432,6 +435,86 @@ describe("ConversationViewer", () => {
 
       expect(out).toContain("ctx_execute");
       expect(out).not.toContain("## ctx_execute");
+    });
+
+    it("omits the entire tool-result block in collapsed mode", () => {
+      const messages = [
+        { role: "user", content: "inspect this" },
+        { role: "assistant", content: [
+          { type: "text", text: "I will check it." },
+          { type: "toolCall", name: "bash", toolUseId: "t1", input: {} },
+        ] },
+        { role: "toolResult", toolUseId: "t1", content: [{ type: "text", text: "secret output\n... (truncated, 2k more characters)" }] },
+        { role: "bashExecution", command: "printf ok", output: "ok" },
+      ];
+      const out = strip(viewerFor(messages, undefined, undefined, 200, "collapsed").render(80).join("\n"));
+
+      expect(out).toContain("[User]");
+      expect(out).toContain("[Assistant]");
+      expect(out).toContain("[Tool: bash]");
+      expect(out).toContain("$ printf ok");
+      expect(out).toContain("ok");
+      expect(out).not.toContain("[Result]");
+      expect(out).not.toContain("secret output");
+      expect(out).not.toContain("truncated, 2k");
+    });
+
+    // subagent_todo 専用の collapsed 例外: 子の進捗だけ展開し、他ツールは折りたたみのまま。
+    it("expands only subagent_todo results in collapsed mode", () => {
+      const todoText = "Todos (2):\n[~] (1) implement feature\n[x] (2) write tests";
+      const messages = [
+        { role: "assistant", content: [
+          { type: "toolCall", name: "subagent_todo", toolUseId: "t-todo", input: {} },
+          { type: "toolCall", name: "bash", toolUseId: "t-bash", input: {} },
+        ] },
+        { role: "toolResult", toolUseId: "t-todo", content: [{ type: "text", text: todoText }] },
+        { role: "toolResult", toolUseId: "t-bash", content: [{ type: "text", text: "secret output" }] },
+      ];
+      const out = strip(viewerFor(messages, undefined, undefined, 200, "collapsed").render(80).join("\n"));
+
+      expect(out).toContain("[Tool: subagent_todo]");
+      expect(out).toContain("[Tool: bash]");
+      expect(out).toContain("[Result]");
+      expect(out).toContain("implement feature");
+      expect(out).not.toContain("secret output");
+    });
+
+    it("expands subagent_todo results carrying toolName directly (pi-ai shape)", () => {
+      const messages = [
+        { role: "assistant", content: [
+          { type: "toolCall", id: "call_1", name: "read", arguments: {} },
+        ] },
+        { role: "toolResult", toolCallId: "call_1", toolName: "read", content: [{ type: "text", text: "file bytes" }] },
+        { role: "toolResult", toolCallId: "call_9", toolName: "subagent_todo", content: [{ type: "text", text: "Todos (1):\n[ ] (1) remaining work" }] },
+      ];
+      const out = strip(viewerFor(messages, undefined, undefined, 200, "collapsed").render(80).join("\n"));
+
+      expect(out).toContain("remaining work");
+      expect(out).not.toContain("file bytes");
+    });
+
+    it("keeps unresolvable tool results collapsed", () => {
+      const messages = [
+        { role: "toolResult", toolUseId: "t-orphan", content: [{ type: "text", text: "orphan output" }] },
+      ];
+      const out = strip(viewerFor(messages, undefined, undefined, 200, "collapsed").render(80).join("\n"));
+
+      expect(out).not.toContain("[Result]");
+      expect(out).not.toContain("orphan output");
+    });
+
+    it("defaults to full results and toggles them with `r`", () => {
+      const onResult = vi.fn();
+      const viewer = viewerFor(result("visible output"), undefined, undefined, 200, "full", onResult);
+
+      expect(strip(viewer.render(80).join("\n"))).toContain("[Result]");
+      viewer.handleInput("r");
+      expect(onResult).toHaveBeenLastCalledWith("collapsed");
+      expect(strip(viewer.render(80).join("\n"))).not.toContain("[Result]");
+
+      viewer.handleInput("r");
+      expect(onResult).toHaveBeenLastCalledWith("full");
+      expect(strip(viewer.render(80).join("\n"))).toContain("[Result]");
     });
 
     it("does not renumber ordered lists even when it does render them", () => {

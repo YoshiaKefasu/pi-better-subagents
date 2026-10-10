@@ -117,6 +117,13 @@ export type WidgetMode = 'all' | 'background' | 'off';
 export type ViewerMarkdownMode = 'off' | 'assistant' | 'all';
 
 /**
+ * Whether tool-result blocks are rendered in the conversation viewer.
+ * - `full`: show the result header, output, and any truncation note.
+ * - `collapsed`: omit tool-result blocks entirely while keeping assistant tool-call rows.
+ */
+export type ResultDisplayMode = 'full' | 'collapsed';
+
+/**
  * How `@handle message` starts an agent that is not already running.
  * - `model`: inject Claude Code's `agent_mention` reminder and let the main
  *   model spawn it with the `Agent` tool, which is what Claude Code does.
@@ -140,8 +147,13 @@ export interface AgentTombstone {
   id: string;
   type: SubagentType;
   description: string;
-  /** Always set — a record with no session file is never tombstoned. */
-  sessionFile: string;
+  /**
+   * pi セッションファイル。GC 時の tombstone 化は sessionFile の有無を問わず
+   * 行うため、未永続セッション（in-memory）の tombstone では undefined になる。
+   * undefined の tombstone は会話の reopen 不可（resume 経路は sessionFile
+   * 必須）が、ハンドル保持と一覧可視のため残す。ディスク永続化の対象でもある。
+   */
+  sessionFile?: string;
   completedAt: number;
 }
 

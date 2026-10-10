@@ -9,7 +9,8 @@ import { type AgentSession, getMarkdownTheme } from "@earendil-works/pi-coding-a
 import { type Component, Input, Markdown, type MarkdownOptions, type MarkdownTheme, matchesKey, type TUI, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { renderAgentName } from "../agent-color.js";
 import { extractText } from "../context.js";
-import type { AgentRecord, ViewerMarkdownMode } from "../types.js";
+import { NESTED_TODO_TOOL_NAME } from "../nested-todos.js";
+import type { AgentRecord, ResultDisplayMode, ViewerMarkdownMode } from "../types.js";
 import { getLifetimeCost, getLifetimeTotal, getSessionContextPercent } from "../usage.js";
 import type { Theme } from "./agent-widget.js";
 import { type AgentActivity, buildInvocationTags, describeActivity, fgPreservingNestedStyles, formatCost, formatDuration, formatSessionTokens, getPromptModeLabel } from "./agent-widget.js";
@@ -137,6 +138,23 @@ function truncationNote(elided: number): string {
   return `... (truncated, ${humanCount(elided)} more character${elided === 1 ? "" : "s"})`;
 }
 
+/**
+ * toolResult メッセージのツール名を解決する。`subagent_todo` だけ collapsed
+ * 例外にするための判定用 (他ツールへの影響ゼロが条件)。
+ *
+ * 実形状 (pi-ai の ToolResultMessage) は `toolName` 直載りだが、旧形状は
+ * `toolUseId`/`toolCallId` のみでツール名を持たないため、先行する assistant
+ * の toolCall から逆引きする (`id`/`toolUseId` → `name`/`toolName` の両対応)。
+ * どちらからも解決できなければ undefined (＝例外対象外として折りたたむ)。
+ */
+function resolveToolResultName(msg: unknown, toolNames: ReadonlyMap<string, string>): string | undefined {
+  const m = msg as { toolName?: unknown; toolCallId?: unknown; toolUseId?: unknown };
+  if (typeof m.toolName === "string" && m.toolName) return m.toolName;
+  const id = m.toolCallId ?? m.toolUseId;
+  if (typeof id === "string" && toolNames.has(id)) return toolNames.get(id);
+  return undefined;
+}
+
 export class ConversationViewer implements Component {
   private scrollOffset = 0;
   private autoScroll = true;
@@ -152,6 +170,8 @@ export class ConversationViewer implements Component {
   private readonly markdownTheme: MarkdownTheme;
   /** Set by the `m` key. Wins over the setting so `m` works without a persist hook. */
   private markdownModeOverride: ViewerMarkdownMode | undefined;
+  /** Set by the `r` key; wins over the persisted setting for this viewer. */
+  private resultDisplayOverride: ResultDisplayMode | undefined;
   /**
    * One `Markdown` per message, so its own text/width cache does the work. A
    * fresh instance per render would re-parse the whole transcript on every
@@ -190,6 +210,10 @@ export class ConversationViewer implements Component {
      * the same thing. Omitted → `m` still cycles, viewer-locally.
      */
     private onMarkdownMode?: (mode: ViewerMarkdownMode) => void,
+    /** The current tool-result display setting. Omitted → `full`. */
+    private resultDisplay?: () => ResultDisplayMode,
+    /** Persist a mode chosen with `r`, when the host wires settings persistence. */
+    private onResultDisplay?: (mode: ResultDisplayMode) => void,
   ) {
     this.markdownTheme = resolveMarkdownTheme(theme);
     this.keys = createViewerKeys(keybindings);
@@ -246,6 +270,14 @@ export class ConversationViewer implements Component {
       const next = MARKDOWN_MODES[(MARKDOWN_MODES.indexOf(this.markdownMode()) + 1) % MARKDOWN_MODES.length];
       this.markdownModeOverride = next;
       this.onMarkdownMode?.(next);
+      this.tui.requestRender();
+      return;
+    }
+    if (matchesKey(data, "r")) {
+      this.stopArmed = false;
+      const next: ResultDisplayMode = this.resultDisplayMode() === "full" ? "collapsed" : "full";
+      this.resultDisplayOverride = next;
+      this.onResultDisplay?.(next);
       this.tui.requestRender();
       return;
     }
@@ -366,6 +398,9 @@ export class ConversationViewer implements Component {
       // at 80 columns with steer + stop present, and this group has no
       // degradation step below "drop the line-count readout".
       actions.push(th.fg("dim", `m ${MARKDOWN_MODE_LABELS[this.markdownMode()]}`));
+      // `r` remains live even though it is not printed here: keeping the
+      // existing navigation hints, especially `Esc close`, matters more than
+      // adding another label to an already dense 80-column footer.
       const footerRight = th.fg("dim", "↑↓ scroll · PgUp/PgDn or Shift+↑↓ · Esc close");
 
       // Prepend the line-count/scroll-% readout only when there's spare width —
@@ -395,6 +430,11 @@ export class ConversationViewer implements Component {
   /** The mode in force: an `m` press, else the setting, else the default. */
   private markdownMode(): ViewerMarkdownMode {
     return this.markdownModeOverride ?? this.viewerMarkdown?.() ?? "assistant";
+  }
+
+  /** The result display mode in force: an `r` press, then setting, then default. */
+  private resultDisplayMode(): ResultDisplayMode {
+    return this.resultDisplayOverride ?? this.resultDisplay?.() ?? "full";
   }
 
   /** Wrap `text` literally — the pre-Markdown path, and the fallback from it. */
@@ -519,6 +559,21 @@ export class ConversationViewer implements Component {
     }
 
     const mode = this.markdownMode();
+    // toolCallId → ツール名の逆引き表。toolResult がツール名を持たない形状
+    // (toolUseId のみ) でも `subagent_todo` 例外を判定できるよう先に走査する。
+    // read専用の線形走査で、既存の描画コストに対する追加は無視できる。
+    const toolNames = new Map<string, string>();
+    for (const msg of messages) {
+      if (msg.role === "assistant" && Array.isArray(msg.content)) {
+        for (const c of msg.content) {
+          if ((c as any).type === "toolCall") {
+            const id = (c as any).id ?? (c as any).toolUseId;
+            const name = (c as any).name ?? (c as any).toolName;
+            if (typeof id === "string" && typeof name === "string") toolNames.set(id, name);
+          }
+        }
+      }
+    }
     let needsSeparator = false;
     for (const msg of messages) {
       if (msg.role === "user") {
@@ -552,6 +607,10 @@ export class ConversationViewer implements Component {
           lines.push(truncateToWidth(th.fg("muted", `  [Tool: ${name}]`), width));
         }
       } else if (msg.role === "toolResult") {
+        // `subagent_todo` 専用の例外 (ハードコード、設定化しない): collapsed
+        // でも子の進捗 (ToDo一覧・状態遷移) が親から読めるよう結果を展開する。
+        // 他ツールは設計通り折りたたみのまま。表示形式は full 時と同一。
+        if (this.resultDisplayMode() === "collapsed" && resolveToolResultName(msg, toolNames) !== NESTED_TODO_TOOL_NAME) continue;
         const { text, elided } = capResult(extractText(msg.content).trim());
         if (!text) continue;
         if (needsSeparator) lines.push(th.fg("dim", "───"));

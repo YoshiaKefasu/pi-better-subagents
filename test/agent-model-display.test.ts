@@ -3,9 +3,11 @@
  * an agent ran with must be the ones it actually ran with.
  *
  * Three ways they used to drift: a subagent that inherited the parent's model
- * showed no model at all, a level pi clamped or an agent file overrode was
- * reported as though it had been honored (#182), and a resume rendered the
- * parameters of the call rather than the session it reopened.
+ * showed no model at all, a level pi clamped was reported as though it had
+ * been honored, and a resume rendered the reopened session's stale settings
+ * instead of the call's applied ones. The current contract: caller parameters
+ * outrank an agent file's frontmatter, and a resume applies its model/thinking
+ * onto the live session — the surfaces render what the run actually uses.
  */
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -18,6 +20,7 @@ vi.mock("../src/agent-runner.js", async () => {
 });
 
 import { resumeAgent, runAgent } from "../src/agent-runner.js";
+import { applyResumeModel } from "../src/invocation-config.js";
 import { registerAgents } from "../src/agent-types.js";
 import subagentsExtension from "../src/index.js";
 
@@ -60,7 +63,13 @@ function ctx() {
 
 /** What a child session reports about itself once pi has resolved it. */
 function session(provider: string, id: string, thinkingLevel: string, name?: string) {
-  return { model: { provider, id, name: name ?? MODEL_NAMES[id] }, thinkingLevel, dispose: vi.fn() } as never;
+  return {
+    model: { provider, id, name: name ?? MODEL_NAMES[id] },
+    thinkingLevel,
+    setModel: vi.fn(),
+    setThinkingLevel: vi.fn(),
+    dispose: vi.fn(),
+  } as never;
 }
 
 const MODELS = [
@@ -213,10 +222,10 @@ describe("Agent tool result — effective model", () => {
   });
 
   // Asserted on the immediate background result, which renders BEFORE a session
-  // exists. That is the only place the two causes of a mismatch are separable:
-  // a clamp cannot have happened yet, so "(asked max)" here can only come from
-  // the agent file outranking the parameter.
-  it("discloses a level an agent file pinned over the caller's (#182)", async () => {
+  // exists. Caller parameters outrank the agent file, so the pin loses and the
+  // rendered level is the caller's — no "(asked …)" disclosure, because nothing
+  // was taken away from the caller.
+  it("prefers the caller's level over an agent file pin", async () => {
     pinnedAgent("thinking: low\n");
     const tool = agentTool();
     vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}) as never);
@@ -229,10 +238,11 @@ describe("Agent tool result — effective model", () => {
       ctx(),
     );
 
-    expect(result.details.tags).toContain("thinking: low (asked max)");
+    expect(result.details.tags).toContain("thinking: max");
+    expect(result.details.tags.join(" ")).not.toContain("asked");
   });
 
-  it("discloses a model an agent file pinned over the caller's (#182)", async () => {
+  it("prefers the caller's model over an agent file pin", async () => {
     pinnedAgent("model: anthropic/claude-haiku-4-5\n");
     const tool = agentTool();
     vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}) as never);
@@ -251,7 +261,7 @@ describe("Agent tool result — effective model", () => {
       ctx(),
     );
 
-    expect(result.details.modelName).toBe("haiku 4.5 (asked anthropic/claude-opus-4-6)");
+    expect(result.details.modelName).toBe("opus 4.6");
   });
 
   it("stays quiet when the caller's spelling names the model that won", async () => {
@@ -273,7 +283,9 @@ describe("Agent tool result — effective model", () => {
     expect(result.details.modelName).toBe("haiku 4.5");
   });
 
-  it("discloses a spelling that names no available model at all", async () => {
+  it("fails loud when the caller's spelling names no available model", async () => {
+    // A caller-supplied model that resolves to nothing is a hard error, not a
+    // silent fallback — so there is no run and no details to render.
     pinnedAgent("model: anthropic/claude-haiku-4-5\n");
     const tool = agentTool();
     vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}) as never);
@@ -286,7 +298,8 @@ describe("Agent tool result — effective model", () => {
       ctx(),
     );
 
-    expect(result.details.modelName).toBe("haiku 4.5 (asked gpt-9)");
+    expect(result.details).toBeUndefined();
+    expect(result.content[0].text).toContain('Model not found: "gpt-9"');
   });
 
   it("says nothing about a request that was honored", async () => {
@@ -311,10 +324,10 @@ describe("Agent tool result — effective model", () => {
 });
 
 describe("Agent tool result — resume", () => {
-  it("renders the reopened session's settings, not the resume call's", async () => {
-    // resumeAgent only prompts the existing session: model and thinking on a
-    // resume call cannot take effect, so rendering them advertises a
-    // configuration the run never had.
+  it("renders the resume call's applied settings, not the reopened session's old ones", async () => {
+    // Resume applies the call's model/thinking onto the live session via
+    // setModel/setThinkingLevel and writes them back to the invocation, so
+    // detailBaseFor renders the settings the resumed run actually uses.
     const s = session("anthropic", "claude-haiku-4-5", "low");
     vi.mocked(runAgent).mockImplementation(async (_c: any, _t: any, _p: any, options: any) => {
       options.onSessionCreated?.(s);
@@ -348,8 +361,101 @@ describe("Agent tool result — resume", () => {
       context,
     );
 
-    expect(resumed.details.modelName).toBe("haiku 4.5");
-    expect(resumed.details.tags).toContain("thinking: low");
-    expect(render(tool, resumed)).not.toContain("opus 4.6");
+    expect(resumed.details.modelName).toBe("opus 4.6");
+    expect(resumed.details.tags).toContain("thinking: max");
+    expect(render(tool, resumed)).toContain("opus 4.6");
+    expect((s as any).setModel).toHaveBeenCalled();
+    expect((s as any).setThinkingLevel).toHaveBeenCalledWith("max");
+  });
+});
+
+describe("applyResumeModel", () => {
+  const registry = () => ({
+    find: (provider: string, id: string) =>
+      MODELS.find(m => m.provider === provider && m.id === id),
+    getAvailable: () => MODELS,
+  }) as any;
+  const parentModel = { provider: "anthropic", id: "claude-opus-4-6", name: "Claude Opus 4.6" };
+  const liveSession = (provider: string, id: string) =>
+    ({ model: { provider, id }, setModel: vi.fn(async () => {}) }) as never;
+
+  it("switches to the explicit model", async () => {
+    const sess = liveSession("anthropic", "claude-opus-4-6");
+    const invocation = {} as any;
+    const err = await applyResumeModel({
+      modelRegistry: registry(),
+      parentModel,
+      cwd: "/tmp",
+      modelInput: "anthropic/claude-haiku-4-5",
+      session: sess,
+      invocation,
+      agentLabel: "test",
+    });
+
+    expect(err).toBeUndefined();
+    expect((sess as any).setModel).toHaveBeenCalledTimes(1);
+    expect(invocation.modelId).toBe("anthropic/claude-haiku-4-5");
+  });
+
+  it("falls back to the frontmatter model without an explicit one", async () => {
+    const sess = liveSession("anthropic", "claude-opus-4-6");
+    const err = await applyResumeModel({
+      modelRegistry: registry(),
+      parentModel,
+      cwd: "/tmp",
+      frontmatterModel: "anthropic/claude-haiku-4-5",
+      session: sess,
+      agentLabel: "test",
+    });
+
+    expect(err).toBeUndefined();
+    expect((sess as any).setModel).toHaveBeenCalledTimes(1);
+    expect((sess as any).setModel.mock.calls[0][0]).toMatchObject({
+      provider: "anthropic",
+      id: "claude-haiku-4-5",
+    });
+  });
+
+  it("skips setModel when the session already runs the resolved model", async () => {
+    const sess = liveSession("anthropic", "claude-opus-4-6");
+    const err = await applyResumeModel({
+      modelRegistry: registry(),
+      parentModel,
+      cwd: "/tmp",
+      modelInput: "anthropic/claude-opus-4-6",
+      session: sess,
+      agentLabel: "test",
+    });
+
+    expect(err).toBeUndefined();
+    expect((sess as any).setModel).not.toHaveBeenCalled();
+  });
+
+  it("skips setModel when nothing resolves", async () => {
+    const sess = liveSession("anthropic", "claude-opus-4-6");
+    const err = await applyResumeModel({
+      modelRegistry: registry(),
+      cwd: "/tmp",
+      session: sess,
+      agentLabel: "test",
+    });
+
+    expect(err).toBeUndefined();
+    expect((sess as any).setModel).not.toHaveBeenCalled();
+  });
+
+  it("returns an error string when the explicit model does not resolve", async () => {
+    const sess = liveSession("anthropic", "claude-opus-4-6");
+    const err = await applyResumeModel({
+      modelRegistry: registry(),
+      parentModel,
+      cwd: "/tmp",
+      modelInput: "gpt-9",
+      session: sess,
+      agentLabel: "test",
+    });
+
+    expect(err).toContain('Model not found: "gpt-9"');
+    expect((sess as any).setModel).not.toHaveBeenCalled();
   });
 });

@@ -16,7 +16,8 @@ import {
   resolveTypeIn,
 } from "./agent-types.js";
 import { loadCustomAgents } from "./custom-agents.js";
-import { isolationParam, resolveAgentInvocationConfig } from "./invocation-config.js";
+import { applyResumeModel, isolationParam, resolveAgentInvocationConfig } from "./invocation-config.js";
+import { parseModelChain } from "./model-fallback-chain.js";
 import { resolveModel } from "./model-resolver.js";
 import { checkModelScope } from "./model-scope.js";
 import {
@@ -52,6 +53,8 @@ const NESTED_TOOL_NAMES = ["Agent", "get_subagent_result", "steer_subagent"] as 
 interface NestedSpawnOptions {
   description: string;
   model?: Model<any>;
+  /** モデルフォールバック連鎖の残り（先頭を除く生文字列）。runAgent が遅延解決する。 */
+  modelFallbacks?: string[];
   maxTurns?: number;
   isolated?: boolean;
   inheritContext?: boolean;
@@ -186,6 +189,22 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
         if (!ownsRecord(existing, context.parentAgentId)) {
           return textResult(`Nested agent not found or not owned by this parent: "${params.resume}".`, true);
         }
+        // 前回の一時 override が残っていれば frontmatter に戻す。
+        // レジストリはこの分岐用に作り直す（worktree 分離下ではコピーを向く）。
+        // child sessions に UI surface は無いため warn 通知はしない。
+        // modelInput は明示指定のみ: frontmatter を混ぜると fromParams 扱いに
+        // なって失敗時に黙殺できなくなる（top-level と同じ形）。
+        const resumeModelError = await applyResumeModel({
+          modelRegistry: ctx.modelRegistry,
+          parentModel: ctx.model,
+          cwd: context.configCwd,
+          modelInput: params.model as string | undefined,
+          frontmatterModel: getAgentConfigIn(loadRegistry(), existing.type)?.model,
+          session: existing.session,
+          invocation: existing.invocation,
+          agentLabel: existing.type,
+        });
+        if (resumeModelError) return textResult(resumeModelError, true);
         const resumed = await context.manager.resume(params.resume, params.prompt, signal);
         return resumed
           ? textResult(formatRecord(resumed, "inline"), resumed.status === "error")
@@ -229,12 +248,16 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
         defaultRunInBackground: false,
       });
       let model = ctx.model;
+      let modelFallbacks: string[] | undefined;
       if (invocation.modelInput) {
-        const resolvedModel = resolveModel(invocation.modelInput, ctx.modelRegistry);
+        // カンマ連鎖時は先頭のみ解決し、残りはフォールバック先として渡す。
+        const chain = parseModelChain(invocation.modelInput);
+        const resolvedModel = resolveModel(chain[0] ?? invocation.modelInput, ctx.modelRegistry);
         if (typeof resolvedModel === "string") {
           if (invocation.modelFromParams) return textResult(resolvedModel, true);
         } else {
           model = resolvedModel;
+          if (chain.length > 1) modelFallbacks = chain.slice(1);
         }
       }
 
@@ -258,6 +281,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       const options: NestedSpawnOptions = {
         description: params.description,
         model,
+        modelFallbacks,
         maxTurns: invocation.maxTurns,
         isolated: invocation.isolated,
         inheritContext: invocation.inheritContext,

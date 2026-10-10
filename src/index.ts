@@ -10,9 +10,9 @@
  *   /agents                 — Interactive agent management menu
  */
 
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
-import { isAbsolute, join } from "node:path";
-import { defineTool, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, getAgentDir, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
+import { type Dirent, existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { basename, isAbsolute, join, resolve, sep } from "node:path";
+import { defineTool, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, getAgentDir, getSettingsListTheme, SessionManager } from "@earendil-works/pi-coding-agent";
 import { Container, Key, matchesKey, type SettingItem, SettingsList, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { abortable } from "./abortable.js";
@@ -21,22 +21,25 @@ import { buildNewAgentFile, disableInContent, enableInContent, isEmptyStub, loca
 import { AgentManager, isTopLevelAgent } from "./agent-manager.js";
 import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, getRememberAgents, normalizeMaxTurns, resolveEffectiveMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, setRememberAgents, steerAgent } from "./agent-runner.js";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, getConfig, getFallbackSubagent, isDefaultsDisabled, NO_FALLBACK, registerAgents, resolveSpawnType, resolveType, setDefaultsDisabled, setFallbackSubagent } from "./agent-types.js";
+import { persistArchiveConfig } from "./archive-settings.js";
 import { inChildSessionContext } from "./child-context.js";
 import { type RpcHandle, registerRpcHandlers } from "./cross-extension-rpc.js";
 import { loadCustomAgents } from "./custom-agents.js";
 import { GroupJoinManager } from "./group-join.js";
-import { isolationParam, resolveAgentInvocationConfig, resolveJoinMode } from "./invocation-config.js";
+import { isolationParam, applyResumeModel, resolveAgentInvocationConfig, resolveJoinMode } from "./invocation-config.js";
 import { describeMention, handleBase, isReservedHandle, parseMention, resolveHandleToType, stripAgentPrefix } from "./mention.js";
 import { runMentionClone } from "./mention-clone.js";
+import { parseModelChain } from "./model-fallback-chain.js";
 import { describeModel, type ModelRegistry, resolveModel } from "./model-resolver.js";
 import { checkModelScope, isScopeModelsEnabled, setScopeModelsEnabled } from "./model-scope.js";
 import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
 import { createOutputFilePath, ensureOutputFile, getOutputTranscriptDefault, sessionTaskDir, setOutputTranscriptDefault, streamToOutputFile, writeInitialEntry } from "./output-file.js";
 import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
+import { ARCHIVE_DIR_NAME, archiveAgeMs, archiveSessions, DEFAULT_ARCHIVE_AGE_HOURS, readArchiveConfig } from "./session-archive.js";
 import { applyAndEmitLoaded, loadSettings, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
 import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
-import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type JoinMode, type NotificationDetails, type SubagentType, type ViewerMarkdownMode, type WidgetMode } from "./types.js";
+import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type JoinMode, type NotificationDetails, type ResultDisplayMode, type SubagentType, type ViewerMarkdownMode, type WidgetMode } from "./types.js";
 import { createMentionProvider, mentionRoster, type TypeInfo } from "./ui/agent-mention.js";
 import {
   type AgentActivity,
@@ -167,8 +170,13 @@ function getStatusLabel(status: string, error?: string): string {
   }
 }
 
+/** Safety net so a runaway giant result (100k+ chars) can't blow up the parent LLM context.
+ * Normal reports (a few thousand to tens of thousands of chars) pass through 100% intact;
+ * only extreme runaway output gets trimmed. */
+const DEFAULT_RESULT_MAX_LEN = 100_000;
+
 /** Format a structured task notification matching Claude Code's <task-notification> XML. */
-function formatTaskNotification(record: AgentRecord, resultMaxLen: number, showCost = false): string {
+function formatTaskNotification(record: AgentRecord, resultMaxLen: number = DEFAULT_RESULT_MAX_LEN, showCost = false): string {
   const status = getStatusLabel(record.status, record.error);
   const durationMs = record.completedAt ? record.completedAt - record.startedAt : 0;
   const totalTokens = getLifetimeTotal(record.lifetimeUsage);
@@ -180,8 +188,9 @@ function formatTaskNotification(record: AgentRecord, resultMaxLen: number, showC
   const cost = showCost ? getLifetimeCost(record.lifetimeUsage) : 0;
   const costXml = cost > 0 ? `<estimated_cost_usd>${cost.toFixed(4)}</estimated_cost_usd>` : "";
 
+  const shouldTruncate = resultMaxLen > 0 && (record.result?.length ?? 0) > resultMaxLen;
   const resultPreview = record.result
-    ? record.result.length > resultMaxLen
+    ? shouldTruncate
       ? record.result.slice(0, resultMaxLen) + "\n...(truncated, use get_subagent_result for full output)"
       : record.result
     : "No output.";
@@ -297,6 +306,198 @@ export const WORKFLOW_FILE_FLAG = "subagents-workflow-file";
  * {@link WORKFLOW_ENTRY_TYPE} imports it from here.
  */
 export { FOREIGN_WORKFLOW_TOOL_NAMES, WORKFLOW_ENTRY_TYPE, type WorkflowEntryData, workflowEntryData };
+
+/**
+ * Find a session on disk by agent id, prefix, session name (e.g. executor#...), or direct path.
+ *
+ * The direct-path leg is fenced: `spawnTopLevel` strips caller-sent
+ * `resumeSessionFile` so a path from outside can never name a file to open,
+ * and this lookup must not become the back door. A raw `.jsonl` path is
+ * therefore accepted only when it is inside this extension's own session dir
+ * or one of the session files it recorded (live records + tombstones, passed
+ * in via `trust`) — anything else reads as `undefined` (`Agent not found`).
+ *
+ * Name/id matching collects every hit and returns `undefined` when more than
+ * one session answers, mirroring `resolveRecord`'s ambiguous-prefix refusal.
+ */
+async function findSessionOnDisk(
+  cwd: string,
+  query: string,
+  trust?: { sessionDir?: string; knownFiles?: Set<string> },
+): Promise<{ path: string; type: string; name?: string } | undefined> {
+  const norm = query.toLowerCase().trim();
+  if (!norm) return undefined;
+
+  if (norm.endsWith(".jsonl")) {
+    // 相対は cwd 起点で解決し、比較も解決後の絶対パスで行う。
+    const abs = resolve(cwd, query);
+    if (!existsSync(abs)) return undefined;
+    const folded = abs.toLowerCase();
+    const inSessionDir = trust?.sessionDir
+      ? folded === trust.sessionDir.toLowerCase() || folded.startsWith(trust.sessionDir.toLowerCase() + sep)
+      : false;
+    let known = false;
+    if (trust?.knownFiles) {
+      for (const f of trust.knownFiles) {
+        if (f.toLowerCase() === folded) { known = true; break; }
+      }
+    }
+    //  fence 外のパスは開かない (Agent not found に寄せる)。
+    if (!inSessionDir && !known) return undefined;
+    return { path: abs, type: "general-purpose" };
+  }
+
+  const matchSession = (s: { name?: string; id?: string; path?: string }) => {
+    const sName = (s.name ?? "").toLowerCase();
+    const sId = (s.id ?? "").toLowerCase();
+
+    // 1. Exact ID match (UUID)
+    if (sId && sId === norm) {
+      const type = sName.includes("#") ? sName.split("#")[0] : "general-purpose";
+      return { path: s.path!, type, name: s.name };
+    }
+
+    // 2. "type#<hashPart>" format: match if query starts with hashPart, or hashPart starts with query
+    if (sName.includes("#")) {
+      const parts = sName.split("#");
+      const hashPart = parts[1];
+      if (hashPart && (norm.startsWith(hashPart) || (norm.length >= 4 && hashPart.startsWith(norm)))) {
+        return { path: s.path!, type: parts[0], name: s.name };
+      }
+    }
+
+    // 3. Exact session name match
+    if (sName && sName === norm) {
+      const type = sName.includes("#") ? sName.split("#")[0] : sName;
+      return { path: s.path!, type, name: s.name };
+    }
+
+    // 4. Prefix match on ID (minimum 6 chars to avoid false positives)
+    if (norm.length >= 6 && sId && sId.startsWith(norm)) {
+      const type = sName.includes("#") ? sName.split("#")[0] : "general-purpose";
+      return { path: s.path!, type, name: s.name };
+    }
+
+    return undefined;
+  };
+
+  // 全 match を収集し、複数なら曖昧として undefined (resolveRecord と同じ規約)。
+  // listAll は list(cwd) を含む可能性があるため path で重複排除する。
+  const hits: { path: string; type: string; name?: string }[] = [];
+  try {
+    const local = await SessionManager.list(cwd);
+    for (const s of local) {
+      const hit = matchSession(s);
+      if (hit) hits.push(hit);
+    }
+  } catch {
+    /* ignore */
+  }
+
+  try {
+    const all = await SessionManager.listAll();
+    for (const s of all) {
+      const hit = matchSession(s);
+      if (hit) hits.push(hit);
+    }
+  } catch {
+    /* ignore */
+  }
+
+  // pi 本体の SessionManager.list はセッション dir 直下の *.jsonl しか見ない
+  // （archive/ 下には降りない）ため、session-archive が有効で子セッションが
+  // archive/ に移動していても見つけられるよう、フォーク側で archive dir を
+  // 直接走査する。2段階: (1) 常にヘッダ先頭行だけ読む id 照合（安価）。
+  // (2) まだヒットが無ければ session_info 名まで読む完全照合。live 側で既に
+  // ヒットがある場合のフル走査は省く（archive は move のため live と重複しない）。
+  if (trust?.sessionDir) {
+    const archived = scanArchiveSessions(trust.sessionDir, matchSession, hits.length === 0);
+    for (const hit of archived) hits.push(hit);
+  }
+
+  const uniq = hits.filter((h, i) => hits.findIndex(x => x.path === h.path) === i);
+  return uniq.length === 1 ? uniq[0] : undefined;
+}
+
+/** archive/ 下の1ファイルから {id, name} を読む。読めなければ undefined。 */
+function readArchivedSessionIdentity(
+  path: string,
+  withName: boolean,
+): { id?: string; name?: string } | undefined {
+  try {
+    const raw = readFileSync(path, "utf-8");
+    const newline = raw.indexOf("\n");
+    const header = JSON.parse(newline >= 0 ? raw.slice(0, newline) : raw) as { id?: unknown };
+    const id = typeof header?.id === "string" ? header.id : undefined;
+    if (!withName) return { id };
+    // pi 本体と同様に最新の session_info 名を採用する（explicit clear 含む）。
+    let name: string | undefined;
+    for (const line of raw.split("\n")) {
+      if (!line.includes('"session_info"')) continue;
+      try {
+        const entry = JSON.parse(line) as { type?: unknown; name?: unknown };
+        if (entry.type === "session_info" && typeof entry.name === "string" && entry.name.trim()) {
+          name = entry.name.trim();
+        }
+      } catch {
+        /* 1行の破損は無視して次へ */
+      }
+    }
+    return { id, name };
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * `<sessionDir>/archive/*.jsonl` を直接走査し、matchSession に掛けてヒットを
+ * 返す。pi 本体の list が archive/ を見ないためのフォーク側フォールバック。
+ * `withName` が false のときはヘッダ id のみで照合する（安価・id/prefix 系のみ
+ * 有効）。テスト用に export している。
+ */
+export function scanArchiveSessions(
+  sessionDir: string,
+  match: (s: { name?: string; id?: string; path?: string }) => { path: string; type: string; name?: string } | undefined,
+  withName: boolean,
+): { path: string; type: string; name?: string }[] {
+  const hits: { path: string; type: string; name?: string }[] = [];
+  let entries: Dirent<string>[];
+  try {
+    entries = readdirSync(join(sessionDir, ARCHIVE_DIR_NAME), { withFileTypes: true });
+  } catch {
+    return hits;
+  }
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith(".jsonl")) continue;
+    const path = join(sessionDir, ARCHIVE_DIR_NAME, entry.name);
+    const identity = readArchivedSessionIdentity(path, withName);
+    if (!identity) continue;
+    const hit = match({ ...identity, path });
+    if (hit) hits.push(hit);
+  }
+  return hits;
+}
+
+/**
+ * tombstone のセッションファイルを実在確認付きで解決する。記録後に
+ * session-archive が `<sessionDir>/archive/` へ移動していても（move のため
+ * basename は不変）見つけられるよう、archive  sibling をフォールバックに探す。
+ * どちらにも無ければ undefined — メンション経路・Agent resume 経路とも従来
+ * 通りその tombstone を落として `Agent not found` 側に寄せる。sessionFile を
+ * 持たない tombstone（in-memory セッションの GC 遺留）は構造上復活不能のため
+ * 同様に undefined を返す。
+ */
+function resolveTombstoneSessionFile(
+  entry: { sessionFile?: string },
+  sessionDir?: string,
+): string | undefined {
+  if (entry.sessionFile && existsSync(entry.sessionFile)) return entry.sessionFile;
+  if (sessionDir && entry.sessionFile) {
+    const archived = join(sessionDir, ARCHIVE_DIR_NAME, basename(entry.sessionFile));
+    if (existsSync(archived)) return archived;
+  }
+  return undefined;
+}
 
 export default function (pi: ExtensionAPI) {
   // Child AgentSessions load normal extensions. Re-entering this extension there
@@ -442,6 +643,26 @@ export default function (pi: ExtensionAPI) {
     setViewerMarkdown(mode);
     persistSettings(ctx, `Viewer markdown set to ${mode}`);
   }
+  /** Whether tool-result blocks are shown in the conversation viewer. */
+  let resultDisplay: ResultDisplayMode = "full";
+  function getResultDisplay(): ResultDisplayMode { return resultDisplay; }
+  function setResultDisplay(mode: ResultDisplayMode): void { resultDisplay = mode; }
+  function chooseResultDisplay(mode: ResultDisplayMode, ctx?: ExtensionCommandContext): void {
+    setResultDisplay(mode);
+    persistSettings(ctx, `Viewer results set to ${mode}`);
+  }
+  /**
+   * The Settings screen's view of the `session-archive` section in pi's
+   * settings (`.pi/settings.json` / global, project wins). Defaults mirror
+   * session-archive.ts: off / 24h. Re-synced on every session_start because
+   * the values live outside this extension and may change under it.
+   */
+  let archiveEnabled = false;
+  let archiveAgeHours = DEFAULT_ARCHIVE_AGE_HOURS;
+  function getArchiveEnabled(): boolean { return archiveEnabled; }
+  function setArchiveEnabled(enabled: boolean): void { archiveEnabled = enabled; }
+  function getArchiveAgeHours(): number { return archiveAgeHours; }
+  function setArchiveAgeHours(hours: number): void { archiveAgeHours = hours; }
   const pendingUsage = new PendingUsagePool();
 
   // ---- Cancellable pending notifications ----
@@ -473,7 +694,7 @@ export default function (pi: ExtensionAPI) {
   function emitIndividualNudge(record: AgentRecord) {
     if (record.resultConsumed) return;  // re-check at send time
 
-    const notification = formatTaskNotification(record, 500, showCost);
+    const notification = formatTaskNotification(record, undefined, showCost);
     const footer = record.outputFile ? `\nFull transcript available at: ${record.outputFile}` : '';
 
     pi.sendMessage<NotificationDetails>({
@@ -503,7 +724,7 @@ export default function (pi: ExtensionAPI) {
         const unconsumed = records.filter(r => !r.resultConsumed);
         if (unconsumed.length === 0) { widget.update(); return; }
 
-        const notifications = unconsumed.map(r => formatTaskNotification(r, 300, showCost)).join('\n\n');
+        const notifications = unconsumed.map(r => formatTaskNotification(r, undefined, showCost)).join('\n\n');
         const label = partial
           ? `${unconsumed.length} agent(s) finished (partial — others still running)`
           : `${unconsumed.length} agent(s) finished`;
@@ -516,7 +737,7 @@ export default function (pi: ExtensionAPI) {
 
         pi.sendMessage<NotificationDetails>({
           customType: "subagent-notification",
-          content: `Background agent group completed: ${label}\n\n${notifications}\n\nUse get_subagent_result for full output.`,
+          content: `Background agent group completed: ${label}\n\n${notifications}`,
           display: true,
           details,
         }, { deliverAs: "followUp", triggerTurn: true });
@@ -589,6 +810,7 @@ export default function (pi: ExtensionAPI) {
     });
 
     // Skip notification if result was already consumed via get_subagent_result
+    // (or delivered synchronously by the stop tool — both set resultConsumed).
     if (record.resultConsumed) {
       agentActivity.delete(record.id);
       widget.markFinished(record.id);
@@ -645,6 +867,11 @@ export default function (pi: ExtensionAPI) {
     // pool grows in a session that will never drain it.
     if (reportUsage) pendingUsage.add(usage);
   });
+
+  // Evicted agents stay reopenable across restarts and session switches: mirror
+  // tombstones to the fork-owned store under the agent dir (best-effort; a
+  // corrupt file starts empty, a failed write never fails the session).
+  manager.enableTombstonePersistence();
 
   // Expose manager via Symbol.for() global registry for cross-package access.
   // Standard Node.js pattern for cross-package singletons (used by OpenTelemetry, etc.).
@@ -743,6 +970,9 @@ export default function (pi: ExtensionAPI) {
       const record = manager.getRecord(id);
       return record !== undefined && isTopLevelAgent(record) ? record : undefined;
     },
+    // Exposed for extensions: resolve an agent by id/prefix/name and stop it.
+    resolveAgentRef,
+    abort: (id: string) => manager.abort(id),
   };
   const ownsManagerRegistry = (globalThis as any)[MANAGER_KEY] === undefined;
   if (ownsManagerRegistry) {
@@ -783,6 +1013,37 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
+  /**
+   * Session archive (see README → Session archive): move stale subagent
+   * session transcripts into `<sessionDir>/archive/`. Opt-in via pi settings
+   * (`session-archive.enabled`), and run from the main session only — a child
+   * session carries its parent in the header and must not sweep on its own
+   * account, or every subagent would race the same archive/ dir at spawn.
+   * Best-effort by design: anything that can fail here is a notify, never an
+   * exception, so startup cannot be taken down by housekeeping.
+   */
+  function archiveStaleSessions(ctx: ExtensionContext): void {
+    try {
+      const config = readArchiveConfig(ctx.cwd);
+      if (!config?.enabled) return;
+      const sessionDir = ctx.sessionManager?.getSessionDir?.();
+      if (!sessionDir) return;
+      if (ctx.sessionManager?.getHeader?.()?.parentSession) return;  // subagent session
+      const result = archiveSessions(sessionDir, archiveAgeMs(config.maxAgeHours));
+      if (result.archived.length === 0) return;  // nothing moved, nothing to say
+      const skipped = result.skipped.length > 0 ? ` · ${result.skipped.length} skipped` : "";
+      ctx.ui.notify(
+        `Archived ${result.archived.length} stale subagent session` +
+          `${result.archived.length === 1 ? "" : "s"}${skipped}`,
+        "info",
+      );
+    } catch (err) {
+      try {
+        ctx.ui.notify(`Session archive failed: ${err instanceof Error ? err.message : String(err)}`, "error");
+      } catch { /* notify itself failed — nothing left to do */ }
+    }
+  }
+
   // Capture ctx from session_start for RPC spawn handler + start the scheduler.
   // This also wires the RPC handlers and broadcasts readiness — on the first
   // bound session_start, so a filtered-out activation never advertises (#142).
@@ -793,6 +1054,14 @@ export default function (pi: ExtensionAPI) {
       fleet.setUICtx(ctx.ui as any);
     }
     manager.clearCompleted(true);
+    // Keep the Settings screen's Session archive items in sync with pi's
+    // settings. archiveStaleSessions re-reads the files itself, so this only
+    // drives the UI.
+    const archiveCfg = readArchiveConfig(ctx.cwd);
+    archiveEnabled = archiveCfg?.enabled === true;
+    archiveAgeHours = archiveCfg?.maxAgeHours ?? DEFAULT_ARCHIVE_AGE_HOURS;
+    // Best-effort housekeeping: stale subagent transcripts move to archive/ (opt-in).
+    archiveStaleSessions(ctx);
     // Guard mirrors the `!scheduler.isActive()` pattern below: session_start
     // fires once per activation, but a double-bind must not leak listeners.
     if (!rpcHandle) {
@@ -930,6 +1199,17 @@ export default function (pi: ExtensionAPI) {
         // must keep holding, since record.outputFile is the sole gate every
         // downstream consumer keys off and a resume must not re-open it.
         const config = getAgentConfig(record.type);
+        // 前回の一時 override が残っていれば frontmatter に戻す（失敗は握る）。
+        await applyResumeModel({
+          modelRegistry: ctx.modelRegistry,
+          parentModel: ctx.model,
+          cwd: ctx.cwd,
+          notifyWarning: (msg) => ctx.ui.notify(msg, "warning"),
+          frontmatterModel: config?.model,
+          session: record.session,
+          invocation: record.invocation,
+          agentLabel: record.type,
+        });
         const resumedRecord = await startBackgroundResume(ctx, record, mention.message, {
           outputTranscript: config?.outputTranscript ?? getOutputTranscriptDefault(),
           maxTurns: normalizeMaxTurns(config?.maxTurns ?? getDefaultMaxTurns()),
@@ -959,11 +1239,20 @@ export default function (pi: ExtensionAPI) {
       // the conversation unrecoverable (Claude Code's `not_reachable`), so drop
       // the entry — a row that can only ever fail is worse than none — and say
       // so rather than quietly sending this message to an unrelated agent.
-      if (!existsSync(entry.sessionFile)) {
+      // archive 移動済みでも reopen できるよう resolveTombstoneSessionFile で探す。
+      const tombSessionFile = resolveTombstoneSessionFile(entry, ctx.sessionManager?.getSessionDir?.());
+      if (!tombSessionFile && !entry.sessionFile) {
+        // 未永続セッションの tombstone は会話の reopen 不可: 復活失敗ではなく
+        // 新規開始にフォールスルーする（live record はあるが session が無い場合と
+        // 同様 — 上の分岐を素通りしたのと同じ扱い）。名前は解放する: 持ち続けて
+        // いると新規が explore-2 になり、蘇らない corpse が名前を塞ぎ続ける。
         manager.dropTombstone(entry.handle);
-        ctx.ui.notify(`Could not resume ${target} — its session is gone.`, "warning");
-        return { action: "handled" };
-      }
+      } else {
+        if (!tombSessionFile) {
+          manager.dropTombstone(entry.handle);
+          ctx.ui.notify(`Could not resume ${target} — its session is gone.`, "warning");
+          return { action: "handled" };
+        }
 
       // The Agent tool deliberately falls back to general-purpose for a type it
       // cannot resolve (#183), which covers a deleted file AND a merely
@@ -986,8 +1275,8 @@ export default function (pi: ExtensionAPI) {
         // exception — both come from a tombstone this extension wrote.
         const id = spawnResolved(pi, ctx, dispatch.type, mention.message, {
           description: entry.description,
-          reclaim: { handle: entry.handle, alias: entry.alias },
-          resumeSessionFile: entry.sessionFile,
+          reclaim: { handle: entry.handle, alias: entry.alias, id: entry.id },
+          resumeSessionFile: tombSessionFile,
           isBackground: true,
         });
         // The agent may still be starting — wait, so a startup failure lands in
@@ -1009,6 +1298,7 @@ export default function (pi: ExtensionAPI) {
         );
       }
       return { action: "handled" };
+      } // end else: sessionFile の無い tombstone は上の if で落として新規開始へ
     }
 
     // No agent under that handle — but the name may still be an agent type, in
@@ -1136,7 +1426,9 @@ export default function (pi: ExtensionAPI) {
   // The last two arguments keep a conversation overlay opened here identical to
   // one opened from `/agents`: same setting on the way in, same persist out.
   const fleet = new FleetList(manager, agentActivity, isShowCostEnabled, getViewerMarkdown,
-    (mode) => chooseViewerMarkdown(mode, currentCtx as unknown as ExtensionCommandContext | undefined));
+    (mode) => chooseViewerMarkdown(mode, currentCtx as unknown as ExtensionCommandContext | undefined),
+    getResultDisplay,
+    (mode) => chooseResultDisplay(mode, currentCtx as unknown as ExtensionCommandContext | undefined));
   let fleetViewEnabled = true;
   function isFleetViewEnabled(): boolean { return fleetViewEnabled; }
   function setFleetViewEnabled(b: boolean): void { fleetViewEnabled = b; fleet.setEnabled(b); }
@@ -1391,8 +1683,10 @@ export default function (pi: ExtensionAPI) {
 
   /** Derive a short model label from a model string. */
   function getModelLabelFromConfig(model: string): string {
+    // チェーン指定時は先頭（プライマリ）のラベルを表示する。
+    const head = parseModelChain(model)[0] ?? model;
     // Strip provider prefix (e.g. "anthropic/claude-sonnet-4-6" → "claude-sonnet-4-6")
-    const name = model.includes("/") ? model.split("/").pop()! : model;
+    const name = head.includes("/") ? head.split("/").pop()! : head;
     // Strip trailing date suffix (e.g. "claude-haiku-4-5-20251001" → "claude-haiku-4-5")
     return name.replace(/-\d{8}$/, "");
   }
@@ -1426,6 +1720,7 @@ export default function (pi: ExtensionAPI) {
       setShowCost,
       setShowModel,
       setViewerMarkdown,
+      setResultDisplay,
     },
     (event, payload) => pi.events.emit(event, payload),
   );
@@ -1608,7 +1903,7 @@ Terse command-style prompts produce shallow, generic work.
       model: Type.Optional(
         Type.String({
           description:
-            'Optional model override. Accepts "provider/modelId" or fuzzy name (e.g. "haiku", "sonnet"). Omit to use the agent type\'s default.',
+            'Optional model override. Accepts "provider/modelId" or fuzzy name (e.g. "haiku", "sonnet"). Comma-separated list (e.g. "provider/modelA, provider/modelB") falls back to the next model on usage-limit errors (429/quota). Omit to use the agent type\'s default.',
         }),
       ),
       thinking: Type.Optional(
@@ -1807,15 +2102,21 @@ Terse command-style prompts produce shallow, generic work.
         defaultRunInBackground: getBackgroundByDefault(),
       });
 
-      // Resolve model from agent config first; tool-call params only fill gaps.
+      // Caller parameters win over the agent file's frontmatter
+      // (resolveAgentInvocationConfig), so resolve the effective input here.
+      // カンマ連鎖の指定時は先頭のみここで解決し、残りはフォールバック先として
+      // spawn 経由で runAgent へ渡す（切替時に遅延解決される）。
       let model = ctx.model;
+      let modelFallbacks: string[] | undefined;
       if (resolvedConfig.modelInput) {
-        const resolved = resolveModel(resolvedConfig.modelInput, ctx.modelRegistry);
+        const chain = parseModelChain(resolvedConfig.modelInput);
+        const resolved = resolveModel(chain[0] ?? resolvedConfig.modelInput, ctx.modelRegistry);
         if (typeof resolved === "string") {
           if (resolvedConfig.modelFromParams) return textResult(resolved);
           // config-specified: silent fallback to parent
         } else {
           model = resolved;
+          if (chain.length > 1) modelFallbacks = chain.slice(1);
         }
       }
 
@@ -1856,26 +2157,13 @@ Terse command-style prompts produce shallow, generic work.
       // This is the pre-session snapshot — agent-manager overwrites it with the
       // effective values the moment a session reports them.
       const { modelName, modelId } = model ? describeModel(model) : { modelName: undefined, modelId: undefined };
-      // What the caller SPELLED, kept only if it names a different model than the
-      // one that won. Model input is fuzzy — `"haiku"` and
-      // `"anthropic/claude-haiku-4-5"` are the same model — so comparing the two
-      // strings would disclose an override that never happened. A spelling that
-      // resolves to nothing is still worth disclosing: it cannot have taken effect.
-      const askedModel = ((asked: string | undefined) => {
-        if (!asked) return undefined;
-        const resolvedAsked = resolveModel(asked, ctx.modelRegistry);
-        if (typeof resolvedAsked === "string") return asked;
-        return resolvedAsked.provider === model?.provider && resolvedAsked.id === model?.id ? undefined : asked;
-      })(resolvedConfig.overridden?.model);
+      // Note: requested* は省略。resolveAgentInvocationConfig の overridden は常時
+      // undefined のため、設定しても buildInvocationTags には何も届かない。
       const effectiveMaxTurns = normalizeMaxTurns(resolvedConfig.maxTurns ?? getDefaultMaxTurns());
       const agentInvocation: AgentInvocation = {
         modelName,
         modelId,
         thinking,
-        // Only set where the agent file outranked the caller, so the surfaces can
-        // disclose a parameter that was accepted but could not take effect (#182).
-        requestedThinking: resolvedConfig.overridden?.thinking,
-        requestedModel: askedModel,
         // Explicit value only — the default fallback would just add noise.
         // Normalize so `0` (unlimited) doesn't surface as a misleading "max turns: 0".
         maxTurns: normalizeMaxTurns(resolvedConfig.maxTurns),
@@ -1900,10 +2188,10 @@ Terse command-style prompts produce shallow, generic work.
        * `detailBase` for a record that exists, which outranks it: the base is a
        * snapshot of what this call REQUESTED, and pi may have resolved a
        * different model or clamped the thinking level (agent-manager writes the
-       * effective values back when the session reports them). Resume goes
-       * further and ignores the model/thinking parameters outright — it runs on
-       * the session it is reopening — so rendering the base there advertises
-       * settings the run never used.
+       * effective values back when the session reports them). A resume applies
+       * the call's model/thinking onto the live session via setModel /
+       * setThinkingLevel and writes them back to the invocation, so rendering
+       * the base there shows the settings the resumed run actually uses.
        *
        * The mode label is rebuilt rather than carried over: it hangs off the
        * agent TYPE, not the invocation, so tags taken straight from
@@ -1967,14 +2255,171 @@ Terse command-style prompts produce shallow, generic work.
         }
       }
 
-      // Resume existing agent
+      // Resume existing agent (exact id, handle/alias, unique id prefix, disk session, or tombstone)
       if (params.resume) {
-        const existing = manager.getRecord(params.resume);
+        const existing = manager.resolveRecord(params.resume);
         if (!existing || !isTopLevelAgent(existing)) {
+          // raw パス受付の fence 用: この拡張が記録したセッション dir と、
+          // 把握済みのセッションファイル集合 (live + tombstone) のみ信頼する。
+          const knownSessionFiles = new Set<string>();
+          for (const rec of manager.listAgents()) {
+            if (rec.sessionFile) knownSessionFiles.add(rec.sessionFile);
+          }
+          for (const tomb of manager.listTombstones()) {
+            if (tomb.sessionFile) knownSessionFiles.add(tomb.sessionFile);
+          }
+          const diskMatch = await findSessionOnDisk(ctx.cwd, params.resume, {
+            sessionDir: ctx.sessionManager?.getSessionDir?.(),
+            knownFiles: knownSessionFiles,
+          });
+          // セッションファイルからの reopen 元。解決順序: (1) disk 上の pi セッション
+          // （live dir＋archive/ 走査）、(2) tombstone（完了後10分のGCでメモリ
+          // レコードが消えた後も残る。tombstone はディスク永続化されセッションを
+          // 跨いで保持される。上限 MAX_TOMBSTONES=1000、セッション境界での全消去なし）。
+          // (2) は `@handle` メンション経路の reclaim＋resumeSessionFile と同等の処理で、
+          // 新規レコードとして復活させる。
+          let reopen: { sessionFile: string; resolvedType: string; description: string; reclaim?: { handle: string; alias?: string; id?: string } } | undefined;
+          if (diskMatch && existsSync(diskMatch.path)) {
+            reloadCustomAgents();
+            const dispatch = resolveSpawnType(diskMatch.type);
+            // tombstone＝メンション経路の拒否規約に揃える: 別エージェントでの
+            // reopen は会話の継続にならないため、型を解決できない場合は
+            // fallback せず Agent not found に落とす (disk 側の従来 fallback を廃止)。
+            if (dispatch.ok && dispatch.fellBackFrom === undefined) {
+              // disk 上のセッションが tombstone 遺留のものと同一なら handle を
+              // 取り戻す (同一性は sessionFile で判定)。tombstone は残す:
+              // live レコードが resolveMention で優先されるため影にならず、
+              // 次回 evict 時に同 handle で上書きされる。
+              const reclaimed = manager.listTombstones().find(t => t.sessionFile === diskMatch.path);
+              reopen = {
+                sessionFile: diskMatch.path,
+                resolvedType: dispatch.type,
+                description: params.description ?? diskMatch.name ?? `Resumed ${dispatch.type}`,
+                reclaim: reclaimed ? { handle: reclaimed.handle, alias: reclaimed.alias, id: reclaimed.id } : undefined,
+              };
+            }
+          } else {
+            const mentionResolved = manager.resolveMention(params.resume);
+            if (mentionResolved?.kind === "tombstone") {
+              const entry = mentionResolved.entry;
+              // archive 移動済みでも reopen できるよう解決してから存在判定する。
+              const tombSessionFile = resolveTombstoneSessionFile(entry, ctx.sessionManager?.getSessionDir?.());
+              if (!tombSessionFile) {
+                // メンション経路と同様、復活不能な tombstone は落とす。
+                // エラーメッセージは従来通り下の `Agent not found` を返す。
+                manager.dropTombstone(entry.handle);
+              } else {
+                reloadCustomAgents();
+                const tombDispatch = resolveSpawnType(entry.type);
+                // disk 経路の fallback とは違い、別エージェントでの reopen は会話の
+                // 継続にならないため受け付けない (メンション経路と同様)。tombstone は
+                // 残す: エージェントの再有効化で handle が再び使えるようになる。
+                if (tombDispatch.ok && tombDispatch.fellBackFrom === undefined) {
+                  reopen = {
+                    sessionFile: tombSessionFile,
+                    resolvedType: tombDispatch.type,
+                    description: params.description ?? entry.description,
+                    reclaim: { handle: entry.handle, alias: entry.alias, id: entry.id },
+                  };
+                }
+              }
+            }
+          }
+          if (reopen) {
+            // メンション経路と同等に: 型解決済みでも worktree strict 等の
+            // spawn 時失敗は throw するため、Agent not found ではなく起動失敗
+            // として返す。
+            let spawnedId: string;
+            try {
+              spawnedId = spawnResolved(pi, ctx, reopen.resolvedType, params.prompt, {
+                description: reopen.description,
+                resumeSessionFile: reopen.sessionFile,
+                reclaim: reopen.reclaim,
+                isBackground: runInBackground,
+                model,
+                thinkingLevel: thinking,
+                maxTurns: effectiveMaxTurns,
+                isolated,
+                isolation,
+              });
+            } catch (err) {
+              return textResult(`Agent failed to start from disk: "${params.resume}". ${err instanceof Error ? err.message : String(err)}`);
+            }
+
+            if (runInBackground) {
+              const rec = manager.getRecord(spawnedId);
+              const isQueued = rec?.status === "queued";
+              return textResult(
+                `Agent ${isQueued ? "queued" : "resumed"} from disk in background.\n` +
+                `Agent ID: ${spawnedId}\n` +
+                `Type: ${reopen.resolvedType}\n` +
+                (rec?.outputFile ? `Output file: ${rec.outputFile}\n` : "") +
+                (isQueued ? `Position: queued (max ${manager.getMaxConcurrent()} concurrent)\n` : "") +
+                `\nYou will be notified when this agent completes.\n` +
+                `Use get_subagent_result to retrieve full results, or steer_subagent to send it messages.`,
+                rec ? { ...detailBaseFor(rec), toolUses: rec.toolUses, tokens: "", durationMs: 0, status: "background" as const, agentId: spawnedId } : undefined,
+              );
+            }
+
+            await manager.awaitStartup(spawnedId);
+            const rec = manager.getRecord(spawnedId);
+            if (!rec) {
+              return textResult(`Agent failed to start from disk: "${params.resume}".`);
+            }
+            if (rec.promise) {
+              await rec.promise;
+            }
+            if (rec.status === "error") {
+              return textResult(`Agent failed: ${rec.error}${partialOutputSuffix(rec)}`, buildDetails(detailBaseFor(rec), rec));
+            }
+            return textResult(
+              rec.result?.trim() || "No output.",
+              buildDetails(detailBaseFor(rec), rec),
+            );
+          }
+
           return textResult(`Agent not found: "${params.resume}". It may have been cleaned up.`);
         }
         if (!existing.session) {
           return textResult(`Agent "${params.resume}" has no active session to resume.`);
+        }
+
+        // Resume reapplies the effective model onto the live session: an explicit
+        // `model` wins, otherwise the agent file's model — symmetric with
+        // `thinking` below, which always reapplies. Without this the previous
+        // run's model would stick.
+        // Note: frontmatter は existing.type から読む。resume は `subagent_type`
+        // を無視するため resolvedConfig（= params.subagent_type 由来）ではない。
+        // 拒否判定が先: setModel は transcript に model_change を追記して走行中
+        // run のプロンプトキャッシュを壊すため、still running で resume できない
+        // 場合にモデルを触ってはならない（manager.resume の拒否と同条件）。
+        if (runInBackground && (existing.status === "running" || existing.status === "queued")) {
+          return textResult(
+            `Agent "${params.resume}" is still ${existing.status} — it can only be resumed once its current run finishes.\n` +
+            `Use steer_subagent to send it a message mid-run, or get_subagent_result to wait for it.`,
+          );
+        }
+        const resumeModelError = await applyResumeModel({
+          modelRegistry: ctx.modelRegistry,
+          parentModel: ctx.model,
+          cwd: ctx.cwd,
+          notifyWarning: (msg) => ctx.ui.notify(msg, "warning"),
+          modelInput: params.model as string | undefined,
+          frontmatterModel: getAgentConfig(existing.type)?.model,
+          session: existing.session,
+          invocation: existing.invocation,
+          agentLabel: existing.type,
+        });
+        if (resumeModelError) return textResult(resumeModelError);
+        if (thinking) {
+          try {
+            existing.session.setThinkingLevel(thinking);
+            if (existing.invocation) {
+              existing.invocation.thinking = thinking;
+            }
+          } catch {
+            /* ignore clamping errors */
+          }
         }
 
         // Background resume: detached run that notifies on completion, mirroring
@@ -1983,17 +2428,6 @@ Terse command-style prompts produce shallow, generic work.
         // so a resumed agent always blocked the main loop until it finished.
         if (runInBackground) {
           const id = existing.id;
-          // A detached resume hands control back while the record stays
-          // "running", so nothing stops the model from resuming the same agent
-          // again mid-run. manager.resume() refuses that (it would orphan the
-          // live run's abort controller); say why here, where the model can act
-          // on it, instead of letting it read as a generic failure.
-          if (existing.status === "running" || existing.status === "queued") {
-            return textResult(
-              `Agent "${params.resume}" is still ${existing.status} — it can only be resumed once its current run finishes.\n` +
-              `Use steer_subagent to send it a message mid-run, or get_subagent_result to wait for it.`,
-            );
-          }
 
           const record = await startBackgroundResume(ctx, existing, params.prompt, {
             outputTranscript,
@@ -2017,7 +2451,7 @@ Terse command-style prompts produce shallow, generic work.
           );
         }
 
-        const record = await manager.resume(params.resume, params.prompt, signal);
+        const record = await manager.resume(existing.id, params.prompt, signal);
         if (!record) {
           return textResult(`Failed to resume agent "${params.resume}".`);
         }
@@ -2056,6 +2490,7 @@ Terse command-style prompts produce shallow, generic work.
           description: params.description,
           name: params.name as string | undefined,
           model,
+          modelFallbacks,
           maxTurns: effectiveMaxTurns,
           isolated,
           inheritContext,
@@ -2210,6 +2645,7 @@ Terse command-style prompts produce shallow, generic work.
           description: params.description,
           name: params.name as string | undefined,
           model,
+          modelFallbacks,
           maxTurns: effectiveMaxTurns,
           isolated,
           inheritContext,
@@ -2873,6 +3309,40 @@ Terse command-style prompts produce shallow, generic work.
     },
   }));
 
+  registerToolReportingUsage(defineTool({
+    name: SUBAGENT_TOOL_NAMES.STOP,
+    label: "Stop Subagent",
+    description:
+      "Stop a running subagent by ID. Use when the user asks to cancel or stop a background agent. Accepts full ID or short prefix (first 8+ chars).",
+    promptSnippet: "Stop a running background agent by ID",
+    parameters: Type.Object({
+      agent_id: Type.String({
+        description: "The agent ID to stop (full UUID or short prefix like 'abc12345'). The agent's handle also works — its `name` if you gave it one, otherwise its type (`explore`, `explore-2`).",
+      }),
+    }),
+    execute: async (_toolCallId, params, _signal, _onUpdate, _ctx) => {
+      // resume 分岐と同様に resolveRecord＋top-level ガードで短 prefix を受ける。
+      const record = manager.resolveRecord(params.agent_id);
+      if (!record || !isTopLevelAgent(record)) {
+        return textResult(`Agent not found: "${params.agent_id}". It may have been cleaned up.`);
+      }
+      if (record.status !== "running" && record.status !== "queued") {
+        return textResult(`Agent "${params.agent_id}" is not running (status: ${record.status}). Cannot stop a non-running agent.`);
+      }
+      const stopped = manager.abort(record.id);
+      if (!stopped) {
+        return textResult(`Failed to stop agent "${params.agent_id}"`);
+      }
+      // 停止結果はこの場で同期的に返すため、settle 時の遅延完了通知は重複ノイズになる。
+      // resultConsumed を立てると onComplete 側の既存ガードが通知だけを抑止する
+      // （lifecycle イベント・履歴追記・widget/fleet 更新は従来通り）。
+      // cancelNudge は保険（この時点では未スケジュールのはずだが settle との競合に備える）。
+      record.resultConsumed = true;
+      cancelNudge(record.id);
+      return textResult(`✅ Stopped agent ${record.id.slice(0, 8)}... (${record.status} → stopped)`);
+    },
+  }));
+
   // ---- /agents interactive menu ----
 
   // Directory resolution and the frontmatter edits live in agent-file-toggle.ts
@@ -2884,7 +3354,8 @@ Terse command-style prompts produce shallow, generic work.
     if (!cfg?.model) return "inherit"; // no model configured → really inherits parent
     const label = getModelLabelFromConfig(cfg.model);
     if (!registry) return label;
-    const resolved = resolveModel(cfg.model, registry);
+    // チェーン指定時は先頭（プライマリ）で解決可否を見る。
+    const resolved = resolveModel(parseModelChain(cfg.model)[0] ?? cfg.model, registry);
     // Configured but unresolvable: the runtime silently falls back to the parent
     // model, so flag it (and the fallback) rather than hiding the config.
     if (typeof resolved === "string") return `${label} (unavailable, fallback: inherit)`;
@@ -3072,7 +3543,7 @@ Terse command-style prompts produce shallow, generic work.
           if (manager.abort(record.id)) {
             ctx.ui.notify(`Stopped "${record.description}".`, "info");
           }
-        }, keybindings, (message: string) => manager.steer(record.id, message), showCost, getViewerMarkdown, (mode) => chooseViewerMarkdown(mode, ctx));
+        }, keybindings, (message: string) => manager.steer(record.id, message), showCost, getViewerMarkdown, (mode) => chooseViewerMarkdown(mode, ctx), getResultDisplay, (mode) => chooseResultDisplay(mode, ctx));
       },
       {
         overlay: true,
@@ -3475,6 +3946,7 @@ Write the file using the write tool. Only write the file, nothing else.`;
       showCost: isShowCostEnabled(),
       showModel: isShowModelEnabled(),
       viewerMarkdown: getViewerMarkdown(),
+      resultDisplay: getResultDisplay(),
     } satisfies SubagentsSettings;
   }
 
@@ -3490,7 +3962,7 @@ Write the file using the write tool. Only write the file, nothing else.`;
   void _settingsSnapshotIsComplete;
 
   const NUMERIC_IDS = new Set([
-    "maxConcurrent", "maxConcurrentForeground", "defaultMaxTurns", "graceTurns", "maxSubagentDepth",
+    "maxConcurrent", "maxConcurrentForeground", "defaultMaxTurns", "graceTurns", "maxSubagentDepth", "archiveAgeHours",
   ]);
 
   async function showSettings(ctx: ExtensionCommandContext) {
@@ -3648,6 +4120,29 @@ Write the file using the write tool. Only write the file, nothing else.`;
             "How much of the conversation viewer renders as Markdown. assistant = assistant text only (default); all = tool results too, for tools that emit Markdown — accepting that a Markdown pass over a diff or a log eats `#` comments, swallows a `---` line and re-fences indented output; off = everything verbatim. `m` in the viewer cycles the same setting (footer: raw / md / md+).",
           currentValue: getViewerMarkdown(),
           values: ["off", "assistant", "all"],
+        },
+        {
+          id: "resultDisplay",
+          label: "Viewer results",
+          description:
+            "Conversation viewer tool results: full (show output, default) or collapsed (hide result blocks). Press `r` in the viewer to toggle.",
+          currentValue: getResultDisplay(),
+          values: ["full", "collapsed"],
+        },
+        {
+          id: "sessionArchive",
+          label: "Session archive",
+          description:
+            "Move stale subagent session transcripts into an archive/ subdirectory at session start. Saved to pi's settings (session-archive.enabled), not subagents.json.",
+          currentValue: getArchiveEnabled() ? "on" : "off",
+          values: ["on", "off"],
+        },
+        {
+          id: "archiveAgeHours",
+          label: "Archive age hours",
+          description: "Idle hours after which a subagent session transcript is archivable (Enter to type). Saved to pi's settings (session-archive.maxAgeHours).",
+          currentValue: String(getArchiveAgeHours()),
+          values: [String(getArchiveAgeHours())],
         },
         {
           id: "fleetView",
@@ -3823,6 +4318,24 @@ Write the file using the write tool. Only write the file, nothing else.`;
       } else if (id === "viewerMarkdown") {
         setViewerMarkdown(value as ViewerMarkdownMode);
         notifyApplied(ctx, `Viewer markdown set to ${value}`);
+      } else if (id === "resultDisplay") {
+        setResultDisplay(value as ResultDisplayMode);
+        notifyApplied(ctx, `Viewer results set to ${value}`);
+      } else if (id === "sessionArchive") {
+        const enabled = value === "on";
+        setArchiveEnabled(enabled);
+        persistArchiveSettings(
+          ctx,
+          enabled
+            ? "Session archive enabled — stale subagent sessions move to archive/ at session start"
+            : "Session archive disabled",
+        );
+      } else if (id === "archiveAgeHours") {
+        const n = parseInt(value, 10);
+        if (n >= 1) {
+          setArchiveAgeHours(n);
+          persistArchiveSettings(ctx, `Archive age set to ${n} hour${n === 1 ? "" : "s"}`);
+        }
       } else if (id === "fleetView") {
         const enabled = value === "on";
         setFleetViewEnabled(enabled);
@@ -3902,7 +4415,9 @@ Write the file using the write tool. Only write the file, nothing else.`;
             ? String(getDefaultMaxTurns() ?? 0)
             : result === "maxSubagentDepth"
               ? String(getMaxSubagentDepth())
-              : String(getGraceTurns());
+              : result === "archiveAgeHours"
+                ? String(getArchiveAgeHours())
+                : String(getGraceTurns());
 
       const label = result === "maxConcurrent"
         ? "Max concurrency (1+)"
@@ -3912,7 +4427,9 @@ Write the file using the write tool. Only write the file, nothing else.`;
             ? "Default max turns (0 = unlimited)"
             : result === "maxSubagentDepth"
               ? "Nested depth (0/1 = nesting off)"
-              : "Grace turns (1+)";
+              : result === "archiveAgeHours"
+                ? "Archive age hours (1+)"
+                : "Grace turns (1+)";
 
       // Loop until user enters a valid integer or cancels (Esc / null).
       // Silently trims whitespace; rejects non-numeric input by re-prompting.
@@ -3963,6 +4480,21 @@ Write the file using the write tool. Only write the file, nothing else.`;
       (event, payload) => pi.events.emit(event, payload),
     );
     ctx.ui.notify(message, level);
+  }
+
+  /**
+   * Persist the session-archive section to pi's project settings.json —
+   * deliberately NOT `saveAndEmitChanged`, whose whole-file rewrite targets
+   * `.pi/subagents.json`; routing pi's own settings through it would wipe
+   * everything else pi has stored there. Mirrors saveSettings' contract:
+   * info on success, warning naming the failure otherwise.
+   */
+  function persistArchiveSettings(ctx: ExtensionCommandContext, successMsg: string): void {
+    const ok = persistArchiveConfig(ctx.cwd, { enabled: archiveEnabled, maxAgeHours: archiveAgeHours });
+    ctx.ui.notify(
+      ok ? successMsg : `${successMsg} (session only; failed to persist to pi settings)`,
+      ok ? "info" : "warning",
+    );
   }
 
   pi.registerCommand("agents", {

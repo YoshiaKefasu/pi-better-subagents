@@ -6,7 +6,8 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
-import type { ExtensionContext, LoadExtensionsResult } from "@earendil-works/pi-coding-agent";
+import type { ExtensionContext, InlineExtension, LoadExtensionsResult } from "@earendil-works/pi-coding-agent";
+import * as piSdk from "@earendil-works/pi-coding-agent";
 import {
   type AgentSession,
   type AgentSessionEvent,
@@ -23,6 +24,9 @@ import { buildParentContext, extractText } from "./context.js";
 import { DEFAULT_AGENTS } from "./default-agents.js";
 import { detectEnv } from "./env.js";
 import { buildMemoryBlock, buildReadOnlyMemoryBlock } from "./memory.js";
+import { classifyRetryFailure, isAuthUnavailable, isUpstreamUnreachableError, isUsageLimitError, parseModelChain, parseRetryDelaySeconds } from "./model-fallback-chain.js";
+import { describeModel, resolveModel } from "./model-resolver.js";
+import { buildTodoNudgePrompt, createNestedTodoTool, getUnfinishedTodos, resolveNestedTodoKey } from "./nested-todos.js";
 import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager } from "./nested-tools.js";
 import { buildAgentPrompt, type PromptExtras } from "./prompts.js";
 import { preloadSkills } from "./skill-loader.js";
@@ -42,6 +46,7 @@ export const SUBAGENT_TOOL_NAMES = {
   WORKFLOW: "SubagentWorkflow",
   GET_RESULT: "get_subagent_result",
   STEER: "steer_subagent",
+  STOP: "stop_subagent",
 } as const;
 
 /** Names of tools registered by this extension that subagents must NOT inherit. */
@@ -255,6 +260,11 @@ export function installExtensionToolScope(
   // and `ext:foo/bar` narrows `foo` to just `bar`.
   const inScope = (): Set<string> => {
     const keep = new Set(toolNames.filter((t) => !disallowedSet?.has(t)));
+    // Tools with `deferred`/`codemode` exposure must stay off the model's tool list
+    // until something declares them — `tool_search` does that, and the block further
+    // down keeps them alive afterwards. Gating this loop is required: without it every
+    // MCP tool would be re-declared on each `turn_end`.
+    const active = new Set(session.getActiveToolNames());
     const optInActive = extNames.size > 0;
     for (const extension of loader.getExtensions().extensions) {
       const canons = extensionCanonicalNames(extension.path);
@@ -262,11 +272,20 @@ export function installExtensionToolScope(
       // First alias that carries a narrowing set — a user won't narrow one
       // extension under two different names, so first-match is correct.
       const narrowed = canons.map((c) => narrowing.get(c)).find(Boolean);
-      for (const name of extension.tools.keys()) {
+      for (const [name, entry] of extension.tools) {
         if (narrowed && !narrowed.has(name)) continue;
         if (disallowedSet?.has(name)) continue;
+        const exposure = entry?.definition?.exposure;
+        if ((exposure === "deferred" || exposure === "codemode") && !active.has(name)) continue;
         keep.add(name);
       }
+    }
+    // Belt-and-braces: keep an already-active deferred/codemode tool in scope, so a
+    // tool that `tool_search` declared survives the next `renarrow()`.
+    for (const tool of session.getAllTools()) {
+      if (!active.has(tool.name)) continue;
+      if (disallowedSet?.has(tool.name)) continue; // disallowed_tools wins over tool_search
+      if (tool.exposure === "deferred" || tool.exposure === "codemode") keep.add(tool.name);
     }
     for (const name of EXCLUDED_TOOL_NAMES) keep.delete(name);
     // Injected tools are legitimately active for this agent — re-admit them so
@@ -358,6 +377,36 @@ export function getGraceTurns(): number { return graceTurns; }
 export function setGraceTurns(n: number): void { graceTurns = Math.max(1, n); }
 
 /**
+ * 未完了 ToDo を残したまま終わろうとした子エージェントへ送るリマインドの上限。
+ * 無限ループ防止（同一セッションへの再送はこの回数まで）。
+ */
+export const MAX_TODO_NUDGES = 5;
+
+/**
+ * サーバー要求 retry-delay（30分以内）時の自前待機。サーバーの指示時間は使わず
+ * 専用定数で指数バックオフする（30s→60s→60s）。stream用 subagents-retry の
+ * baseDelayMs（1.2s系）とは独立。最大3回 — 超えたらフォールバックへ。
+ */
+const OWN_RETRY_BASE_MS = 30_000;
+const OWN_RETRY_BACKOFF_CAP_MS = 60_000;
+const OWN_RETRY_MAX = 3;
+
+/** 中断対応の待機。abort 済みなら即時復帰する。 */
+function sleepAbortable(ms: number, signal?: AbortSignal): Promise<void> {
+  if (ms <= 0) return Promise.resolve();
+  if (signal?.aborted === true) return Promise.resolve();
+  return new Promise(resolve => {
+    const timer = setTimeout(done, ms);
+    function done(): void {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", done);
+      resolve();
+    }
+    signal?.addEventListener("abort", done, { once: true });
+  });
+}
+
+/**
  * Try to find the right model for an agent type.
  * Priority: explicit option > config.model > parent model.
  */
@@ -367,10 +416,13 @@ export function resolveDefaultModel(
   configModel?: string,
 ): Model<any> | undefined {
   if (configModel) {
-    const slashIdx = configModel.indexOf("/");
+    // カンマ連鎖の指定時は先頭のみ解決する。フォールバック先は実行時
+    // （runAgent のプロンプトループ）に遅延解決させるため、ここでは触らない。
+    const head = parseModelChain(configModel)[0] ?? configModel;
+    const slashIdx = head.indexOf("/");
     if (slashIdx !== -1) {
-      const provider = configModel.slice(0, slashIdx);
-      const modelId = configModel.slice(slashIdx + 1);
+      const provider = head.slice(0, slashIdx);
+      const modelId = head.slice(slashIdx + 1);
 
       // Build a set of available model keys for fast lookup
       const available = registry.getAvailable?.();
@@ -400,6 +452,12 @@ export interface RunOptions {
   /** Manager-assigned id; suffixes session name to disambiguate parallel spawns (e.g. `Explore#a1b2c3d4`). */
   agentId?: string;
   model?: Model<any>;
+  /**
+   * モデルフォールバック連鎖の残り（先頭を除く生文字列）。先頭は `model`
+   * または agentConfig.model として解決済みのはずで、ここにある分は
+   * プロンプトループが切替時点で遅延解決する。カンマ無し指定では空。
+   */
+  modelFallbacks?: string[];
   maxTurns?: number;
   signal?: AbortSignal;
   isolated?: boolean;
@@ -744,12 +802,43 @@ export async function runAgent(
           };
         };
 
+  // Built-in extensions are only loaded by pi's CLI entry point. Child sessions are
+  // SDK-created, so builtins must be supplied explicitly: codemode runs scripts,
+  // tool-search pulls deferred tools out of the shelf, and mcp registers the
+  // servers from mcp.json. Each registers inactive and only activates when an
+  // agent declares the name in its `tools:` list.
+  // Guarded for older pi versions and for vitest module mocks that throw on
+  // unknown-export access.
+  const makeBuiltinFactory = (thunk: () => unknown): InlineExtension | undefined => {
+    // NOTE: the thunk body (piSdk property access + factory call) runs inside
+    // this try/catch because vitest module mocks may throw on unknown-export
+    // access, and older pi versions may lack the export entirely.
+    try {
+      const factory = thunk();
+      // InlineExtension is a function (ExtensionFactory) or a { name, factory } object.
+      return typeof factory === "function" || (typeof factory === "object" && factory !== null)
+        ? (factory as InlineExtension)
+        : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+  // CLI's builtInExtensions order: codemode → tool-search → mcp.
+  const builtinFactories: InlineExtension[] = [
+    makeBuiltinFactory(() => piSdk.createCodemodeExtension()),
+    makeBuiltinFactory(() =>
+      (piSdk as { createToolSearchExtension?: () => InlineExtension }).createToolSearchExtension?.(),
+    ),
+    makeBuiltinFactory(() => (piSdk as { createMcpExtension?: () => InlineExtension }).createMcpExtension?.()),
+  ].filter((f): f is InlineExtension => f !== undefined);
+
   const loader = new DefaultResourceLoader({
     cwd: configCwd,
     agentDir,
     noExtensions,
     additionalExtensionPaths,
     extensionsOverride,
+    ...(builtinFactories.length > 0 && !noExtensions ? { extensionFactories: builtinFactories } : {}),
     noSkills,
     noPromptTemplates: true,
     noThemes: true,
@@ -828,10 +917,19 @@ export async function runAgent(
     }
   }
 
-  // Resolve model: explicit option > config.model > parent model
+  // Resolve model: explicit option > config.model > parent model.
+  // カンマ連鎖の指定時は先頭のみここで解決する。フォールバック先は生文字列の
+  // ままプロンプトループへ渡し、切替時点で解決する（遅延解決：フォールバック先の
+  // 認証有無はその時点で変わり得るため）。
+  const configChain = options.model === undefined ? parseModelChain(agentConfig?.model ?? "") : [];
   const model = options.model ?? resolveDefaultModel(
     ctx.model, ctx.modelRegistry, agentConfig?.model,
   );
+  const pendingFallbacks: string[] = [...(options.modelFallbacks ?? []), ...configChain.slice(1)];
+  // フォールバック発動のたびに1行ずつ残す透過性メモ（モデル X→Y の切替記録）。
+  const modelSwitchNotes: string[] = [];
+  // ToDo リマインド送出のたびに1行ずつ残す透過性メモ（親から確認できるよう応答末尾に付与）。
+  const todoNudgeNotes: string[] = [];
 
   // Resolve thinking level: explicit option > agent config > undefined (inherit)
   const thinkingLevel = options.thinkingLevel ?? agentConfig?.thinking;
@@ -865,6 +963,19 @@ export async function runAgent(
     : [];
   const nestedToolNames = new Set(nestedTools.map(tool => tool.name));
 
+  // Subagent-private todos (subagent_todo). Every non-isolated nested session
+  // gets one — no `allowed_subagents` opt-in needed and no depth gate: the
+  // depth cap governs delegation, not self-tracking, and progress management
+  // is useful precisely to agents that spawn nothing. Never for the main
+  // session (`options.nestedRuntime` is undefined there), never when isolated.
+  const todoTools = options.nestedRuntime && !options.isolated
+    ? [createNestedTodoTool({
+        manager: options.nestedRuntime.manager,
+        parentAgentId: options.nestedRuntime.parentAgentId,
+      })]
+    : [];
+  const todoToolNames = new Set(todoTools.map(tool => tool.name));
+
   // The `agent({ schema })` contract: this child reports its answer by calling
   // StructuredOutput, and `structuredJson` below is what the caller reads. The
   // schema was already compiled by whoever asked for it, so a bad one failed
@@ -875,15 +986,16 @@ export async function runAgent(
     : [];
   const structuredToolNames = new Set(structuredTools.map(tool => tool.name));
   // Re-admitted together at every gate below. Kept as one set so a new injected
-  // tool cannot be added to some of the three gates and forgotten at the rest.
+  // tool cannot be added to some of the gates and forgotten at the rest.
   //
-  // `disallowed_tools` is applied HERE rather than at the gates, because the two
-  // kinds answer to it differently: a nested delegation tool is an opt-in the
-  // agent's own frontmatter can take back, while StructuredOutput exists only
-  // because this call asked for a schema — removing it would make the request
-  // unsatisfiable by construction rather than merely restricted.
+  // `disallowed_tools` is applied HERE rather than at the gates, because the kinds
+  // answer to it differently: a nested delegation tool or the todo tool is an
+  // opt-in the agent's own frontmatter can take back, while StructuredOutput
+  // exists only because this call asked for a schema — removing it would make
+  // the request unsatisfiable by construction rather than merely restricted.
   const readmitToolNames = new Set([
     ...[...nestedToolNames].filter(name => !disallowedSet?.has(name)),
+    ...[...todoToolNames].filter(name => !disallowedSet?.has(name)),
     ...structuredToolNames,
   ]);
 
@@ -926,6 +1038,8 @@ export async function runAgent(
         (t) => !EXCLUDED_TOOL_NAMES.includes(t) && !disallowedSet?.has(t),
       ),
       ...[...nestedToolNames].filter((t) => !disallowedSet?.has(t)),
+      // The private todo tool rides the same opt-out as the nested tools.
+      ...[...todoToolNames].filter((t) => !disallowedSet?.has(t)),
       // Not filtered through `disallowedSet`, unlike the nested tools above:
       // the caller asked for a schema, and removing the only tool that can
       // satisfy it would make the request unsatisfiable by construction rather
@@ -995,7 +1109,7 @@ export async function runAgent(
     ...(parentModelRuntime !== undefined && { modelRuntime: parentModelRuntime as never }),
     model,
     tools: sessionTools,
-    customTools: [...nestedTools, ...structuredTools],
+    customTools: [...nestedTools, ...todoTools, ...structuredTools],
     resourceLoader: loader,
   };
   if (sessionExcludeTools) {
@@ -1046,6 +1160,8 @@ export async function runAgent(
 
   // Track turns for graceful max_turns enforcement
   let turnCount = 0;
+  // フォールバック判定用：tool が1回でも実行されたか（2ターン目以降＝作業ありの目安）。
+  let toolUsed = false;
   const maxTurns = resolveEffectiveMaxTurns(type, options.maxTurns);
   let softLimitReached = false;
   let aborted = false;
@@ -1073,6 +1189,7 @@ export async function runAgent(
       options.onTextDelta?.(event.assistantMessageEvent.delta, currentMessageText);
     }
     if (event.type === "tool_execution_start") {
+      toolUsed = true;
       options.onToolActivity?.({ type: "start", toolName: event.toolName });
     }
     if (event.type === "tool_execution_end") {
@@ -1109,26 +1226,162 @@ export async function runAgent(
   // on counts as this run's output (a fresh session, so usually 0).
   const startLen = session.messages.length;
   let structuredRetried = false;
+  // 最後にプロンプトが throw した時の原本。解決済み failure（文字列）と違い、
+  // throw は呼び出し元（manager の .catch 経路＝stream リトライ判定）に
+  // そのまま届けるのが従来動作のため、フォールバック枯渇時も throw で返す。
+  let lastThrown: unknown;
+  // 直近の試行の失敗文言（成功時は undefined）。ループの継続・切替判断に使う。
+  let failure: string | undefined;
+  let promptToSend = effectivePrompt;
+  // 同一モデルでの継続を試したか（モデルごとに1回まで — 無限再送の防止）。
+  let sameModelContinued = false;
+  // サーバー要求 retry-delay（30分以内）の自前リトライ回数（上限超過でフォールバックへ）。
+  // モデル切替成功時にリセットする。
+  let ownRetryCount = 0;
+  // 未完了 ToDo リマインドの送出回数（MAX_TODO_NUDGES で上限）。
+  let todoNudgeCount = 0;
   try {
-    await session.prompt(effectivePrompt);
+    for (;;) {
+      try {
+        await session.prompt(promptToSend);
+        failure = finalTurnError(session, startLen);
+        lastThrown = undefined;
+      } catch (err) {
+        // throw されたエラーが使用制限でも retry-delay でもなければ従来通り
+        // そのまま上へ（manager の .catch が stream リトライ可否を判定する）。
+        // 即 rethrow の意味は変えない — retry-delay 付きだけ failure として
+        // ループ下の秒数分岐へ回す。
+        // 使用制限（429 系）と上流到達不能（502 系）は throw せず failure として
+        // 下のフォールバック分岐へ回す。どちらも同じモデルで粘っても回復見込みが
+        // 薄く、次のモデルへ降りる対象（エージェントを放棄しない）。
+        const message = err instanceof Error ? err.message : String(err);
+        if (parseRetryDelaySeconds(message) === undefined
+          && !isUsageLimitError(message)
+          && !isUpstreamUnreachableError(message)) throw err;
+        failure = message;
+        lastThrown = err;
+      }
 
-    // One more prompt when a schema was asked for and nothing usable came back
-    // — the model answered in prose, or only ever called the tool invalidly.
-    // Inside this `try`, so the turn tracking, the text collector and above all
-    // the abort forwarding are still live: torn down first, a retry would be
-    // unkillable.
-    if (structuredCapture !== undefined && structuredCapture.json === undefined
-      && !aborted && options.signal?.aborted !== true) {
-      structuredRetried = true;
-      await session.prompt(structuredRetryPrompt(structuredCapture));
+      // One more prompt when a schema was asked for and nothing usable came back
+      // — the model answered in prose, or only ever called the tool invalidly.
+      // Inside this `try`, so the turn tracking, the text collector and above all
+      // the abort forwarding are still live: torn down first, a retry would be
+      // unkillable. この再送ターンも下のフォールバック判定の対象になる。
+      if (failure === undefined && !structuredRetried && structuredCapture !== undefined
+        && structuredCapture.json === undefined
+        && !aborted && options.signal?.aborted !== true) {
+        structuredRetried = true;
+        promptToSend = structuredRetryPrompt(structuredCapture);
+        continue;
+      }
+      // 未完了 ToDo を残したまま終わろうとした子エージェントは同一セッションで続行させる。
+      // structuredOutput リトライの後、通常 break の直前（成功時のみ・中断時は送らない）。
+      if (
+        failure === undefined &&
+        options.nestedRuntime &&
+        !softLimitReached &&
+        !aborted && options.signal?.aborted !== true &&
+        todoNudgeCount < MAX_TODO_NUDGES
+      ) {
+        const record = options.nestedRuntime.manager.getRecord?.(options.nestedRuntime.parentAgentId);
+        const todoKey = record ? resolveNestedTodoKey(record) : options.nestedRuntime.parentAgentId;
+        const unfinished = getUnfinishedTodos(todoKey);
+        if (unfinished.length > 0) {
+          todoNudgeCount++;
+          promptToSend = buildTodoNudgePrompt(unfinished);
+          todoNudgeNotes.push(`未完了 ToDo が ${unfinished.length} 件残っていたため、作業の続行をリマインドしました（${todoNudgeCount}/${MAX_TODO_NUDGES} 回目）。`);
+          continue;
+        }
+      }
+      if (failure === undefined) break; // 成功
+      // 中断後の切替は行わない（abort 後に別モデルで仕事を始めてはならない）。
+      if (aborted || options.signal?.aborted === true) break;
+      // retry-delay 分岐は classifyRetryFailure（model-fallback-chain とテストで共有）に一任。
+      // 30分以内は専用定数で待って同一モデル再送（フォールバック非消費）、使い切り・30分超はフォールバックへ。
+      const retryClass = classifyRetryFailure(failure);
+      // 透過性メモと再送プロンプトの原因表示。502 系を「使用制限」と呼ぶのは誤るため分ける。
+      const failureCauseLabel = isUpstreamUnreachableError(failure) ? "上流到達不能エラー" : "使用制限エラー";
+      const requestedDelayS = parseRetryDelaySeconds(failure);
+      if (retryClass === "own-retry" && ownRetryCount < OWN_RETRY_MAX) {
+        ownRetryCount++;
+        const waitMs = Math.min(OWN_RETRY_BASE_MS * 2 ** (ownRetryCount - 1), OWN_RETRY_BACKOFF_CAP_MS);
+        await sleepAbortable(waitMs, options.signal);
+        if (aborted || options.signal?.aborted) break;
+        promptToSend = `（サーバーから ${requestedDelayS}s のリトライ待機が要求されましたが、短時間のためフォーク側の設定で待機して同一モデルで再送します。エラー: ${failure}）\n続きを進めてください。`;
+        continue;
+      }
+      // 使用制限扱い：fallback 判定、または短 delay の自前リトライ使い切り。
+      const ownExhausted = retryClass === "own-retry" && ownRetryCount >= OWN_RETRY_MAX;
+      const usageLike = retryClass === "fallback" || ownExhausted;
+      // ターンを1回以上完了 or tool 実行済みなら「作業あり」とみなす。
+      // auth枯渇は作業がなく失うものがないため hasPriorWork なしでも同一継続を1回だけ許可する。
+      const hasPriorWork = toolUsed || turnCount >= 1;
+      // retry-delay 付きは自前リトライ側で回数管理済みのためここでは扱わない
+      // （短は上で再送し、使い切ったら下のフォールバックへ。長はフォールバック直行）。
+      // retry-delay 付き auth（実測形 Server requested 21555s ... auth_unavailable）は同一モデル継続を通さずフォールバック直行する。
+      const isUpstreamErr = isUpstreamUnreachableError(failure);
+      if (requestedDelayS === undefined && retryClass === "fallback" && !sameModelContinued &&
+          (isUpstreamErr || isAuthUnavailable(failure))) {
+        // 作業ロスト防止：同一セッション・同一モデルでの継続を1回だけ試す。
+        // stream リトライには回さない（429 系で同一モデルに粘ると CPA 側の
+        // クールダウンを汚染するため、粘着はこの1回に限定する）。
+        sameModelContinued = true;
+        promptToSend = `（${failureCauseLabel}のため中断しました。エラー: ${failure}）\n続きを進めてください。`;
+        continue;
+      }
+      // 使用制限扱いでない失敗、または連鎖の枯渇は従来の失敗扱いで抜ける。
+      if (!usageLike || pendingFallbacks.length === 0) break;
+      // フォールバック：次モデルへ。エントリはここで初めて解決する（遅延解決）。
+      let switched = false;
+      while (pendingFallbacks.length > 0 && !switched) {
+        const nextInput = pendingFallbacks.shift()!;
+        const resolvedNext = resolveModel(nextInput, ctx.modelRegistry);
+        if (typeof resolvedNext === "string") {
+          // その時点で解決不能（未認証等）な候補は飛ばして次へ。
+          // 全滅した場合はこの解決エラーが最後のエラーとして残る。
+          failure = resolvedNext;
+          lastThrown = undefined;
+          continue;
+        }
+        const fromId = session.model ? describeModel(session.model).modelId : nextInput;
+        try {
+          // pi のセッションモデル切替 API（AgentSession.setModel）が存在する
+          // ため新規セッション方式ではなくこちらを優先する：同一セッションに
+          // 留まるので履歴・tool 結果が失われず、作業ロストが起きない。
+          await session.setModel(resolvedNext);
+          if (aborted || options.signal?.aborted) break;
+        } catch (err) {
+          // 切替失敗（そのモデルの認証なし等）は次の候補へ。
+          failure = err instanceof Error ? err.message : String(err);
+          lastThrown = err;
+          continue;
+        }
+        const toId = describeModel(resolvedNext).modelId;
+        modelSwitchNotes.push(`モデルを ${fromId} → ${toId} に切り替えて継続しました（${failureCauseLabel}のため）。`);
+        sameModelContinued = false;
+        ownRetryCount = 0;
+        // 同一プロンプトで継続する（履歴はセッションに残っている）。
+        promptToSend = effectivePrompt;
+        failure = undefined;
+        lastThrown = undefined;
+        switched = true;
+      }
+      if (!switched) break; // 全モデル枯渇：最後のエラーをそのまま返す
     }
   } finally {
     unsubTurns();
     collector.unsubscribe();
     cleanupAbort();
   }
+  // throw で終わった試行が最後なら従来通り reject する（manager の .catch 経路）。
+  // own-retry待機中のabortは failure/lastThrown を残したまま抜けるが成功扱いにせず投げもしない。
+  if (failure !== undefined && lastThrown !== undefined && !aborted && options.signal?.aborted !== true) throw lastThrown;
 
-  const responseText = collector.getText().trim() || getLastAssistantText(session, startLen);
+  const baseText = collector.getText().trim() || getLastAssistantText(session, startLen);
+  const transparencyNotes = [...modelSwitchNotes, ...todoNudgeNotes];
+  const responseText = transparencyNotes.length > 0
+    ? (baseText ? `${baseText}\n\n${transparencyNotes.join("\n")}` : transparencyNotes.join("\n"))
+    : baseText;
   // A child asked for structured output that never gave any has failed, however
   // articulate its prose was. Reported through `failure` so it travels the same
   // path as a provider error rather than arriving as a successful empty answer.
@@ -1142,7 +1395,10 @@ export async function runAgent(
     session,
     aborted,
     steered: softLimitReached,
-    failure: finalTurnError(session, startLen) ?? structuredFailure,
+    // ループ内の failure を優先する：切替時の遅延解決エラー等は最終ターンに
+    // 記録されないため、再計算だけでは失われる。成功時は undefined なので
+    // 従来通り再計算（＋構造化失敗）が効く。
+    failure: failure ?? finalTurnError(session, startLen) ?? structuredFailure,
     ...(structuredCapture?.json !== undefined ? { structuredJson: structuredCapture.json } : {}),
     ...(structuredRetried ? { structuredRetried } : {}),
   };

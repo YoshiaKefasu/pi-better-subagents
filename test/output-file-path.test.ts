@@ -1,52 +1,42 @@
-// README:142 promises the transcript root is owner-only `0700`. Transcripts
-// hold the agent's full conversation — user prompts, file contents, tool output —
-// in a shared temp dir, so that mode is the only thing keeping them from every
-// other local user. `createOutputFilePath` is mocked in the one wiring test that
-// touches it, so this body had never actually executed under test.
-//
-// This lives in its own file because it must mock `node:os`. The real root is
-// `<os-tmpdir>/pi-subagents-<uid>` — one path shared by every worker AND by the
-// e2e suites that spawn real agents. Mutating it directly makes the test race
-// against anything else writing a transcript (observed: passes alone, fails
-// intermittently in the full run). Redirecting `tmpdir()` gives each run its own
-// root and removes the shared state entirely.
+// README: transcript root is owner-only `0700`. Transcripts hold the agent's
+// full conversation — user prompts, file contents, tool output — so that mode
+// is the only thing keeping them from other local users. The root used to be
+// `<os-tmpdir>/pi-subagents-<uid>` (swept on reboot, shared with every worker
+// and e2e suite); it is now fork-owned under `<agentDir>/tmp/subagents-output`.
+// `PI_CODING_AGENT_DIR` is redirected per test because `getAgentDir()` reads it
+// on every call — no module mock needed.
 
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, statSync } from "node:fs";
-import { tmpdir as realTmpdir } from "node:os";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { createOutputFilePath, encodeCwd } from "../src/output-file.js";
 
-const fakeTmp = vi.hoisted(() => ({ dir: "" }));
-
-vi.mock("node:os", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("node:os")>();
-  return { ...actual, tmpdir: () => fakeTmp.dir || actual.tmpdir() };
-});
-
-import { createOutputFilePath } from "../src/output-file.js";
-
-const UID = process.getuid?.() ?? 0;
 const AGENT = "agent-xyz";
 const SESSION = "session-123";
 
 describe("createOutputFilePath", () => {
+  let agentDir: string;
+  let prevAgentDir: string | undefined;
   let root: string;
 
   beforeEach(() => {
-    // realpath: macOS resolves /var → /private/var, and the module joins the
-    // raw tmpdir() value, so comparisons must use the same form.
-    fakeTmp.dir = realpathSync(mkdtempSync(join(realTmpdir(), "pi-outpath-")));
-    root = join(fakeTmp.dir, `pi-subagents-${UID}`);
+    prevAgentDir = process.env.PI_CODING_AGENT_DIR;
+    agentDir = mkdtempSync(join(tmpdir(), "pi-outpath-agentdir-"));
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    root = join(agentDir, "tmp", "subagents-output");
   });
 
   afterEach(() => {
-    rmSync(fakeTmp.dir, { recursive: true, force: true });
-    fakeTmp.dir = "";
+    if (prevAgentDir == null) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = prevAgentDir;
+    rmSync(agentDir, { recursive: true, force: true });
   });
 
-  it("builds the documented layout: <root>/<encoded-cwd>/<session>/tasks/<agent>.output", () => {
+  it("builds the documented layout: <agentDir>/tmp/subagents-output/<encoded-cwd>/<session>/tasks/<agent>.output", () => {
     const path = createOutputFilePath("/home/user/project", AGENT, SESSION);
     expect(path).toBe(join(root, "home-user-project", SESSION, "tasks", `${AGENT}.output`));
+    expect(encodeCwd("/home/user/project")).toBe("home-user-project");
   });
 
   it("creates the directory chain so the first write cannot fail", () => {
@@ -63,6 +53,11 @@ describe("createOutputFilePath", () => {
     expect(a).not.toBe(b);
   });
 
+  it("no longer places transcripts under the OS temp sweep", () => {
+    const path = createOutputFilePath("/home/user/project", AGENT, SESSION);
+    expect(path).not.toContain("pi-subagents-");
+  });
+
   it.skipIf(process.platform === "win32")("creates the root owner-only", () => {
     createOutputFilePath("/home/user/project", AGENT, SESSION);
     expect(statSync(root).mode & 0o777).toBe(0o700);
@@ -75,6 +70,8 @@ describe("createOutputFilePath", () => {
     // keep its wide permissions and every transcript written into it would be
     // readable by every local user. (mkdir's own `mode: 0o700` cannot cover
     // this: umask only clears bits, so a fresh mkdir is never too permissive.)
+    // Note only the fork-owned `subagents-output` root is tightened — the
+    // shared `tmp/` above it is created but never chmodded.
     mkdirSync(root, { recursive: true, mode: 0o755 });
     chmodSync(root, 0o755); // defeat umask so the premise really holds
     expect(statSync(root).mode & 0o777).toBe(0o755);

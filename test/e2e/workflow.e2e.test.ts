@@ -22,6 +22,7 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fauxText, fauxToolCall } from "@earendil-works/pi-ai";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it } from "vitest";
 import { encodeCwd } from "../../src/output-file.js";
 import { readJournal } from "../../src/workflow/journal.js";
@@ -48,10 +49,12 @@ const workflowCall = (script: string, id = "wf-call-1") =>
 
 /**
  * Every workflow journal written for `cwd`, across whatever session id the run
- * ended up with. The path is derived the same way `sessionTaskDir` derives it.
+ * ended up with. The path is derived the same way `sessionTaskDir` derives it —
+ * under the run's hermetic agent dir (not the OS temp dir). Callers run this
+ * before `dispose()`, while the hermetic env is still in force.
  */
 function journalsFor(cwd: string): string[] {
-  const root = join(tmpdir(), `pi-subagents-${process.getuid?.() ?? 0}`, encodeCwd(cwd));
+  const root = join(getAgentDir(), "tmp", "subagents-output", encodeCwd(cwd));
   if (!existsSync(root)) return [];
   const found: string[] = [];
   for (const session of readdirSync(root)) {

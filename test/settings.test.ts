@@ -162,6 +162,15 @@ describe("settings persistence", () => {
     expect(loadSettings(projectDir)).toEqual({}); // invalid value dropped
   });
 
+  it("round-trips resultDisplay; keeps valid values, drops invalid", () => {
+    saveSettings({ resultDisplay: "collapsed" }, projectDir);
+    expect(loadSettings(projectDir)).toEqual({ resultDisplay: "collapsed" });
+    saveSettings({ resultDisplay: "full" }, projectDir);
+    expect(loadSettings(projectDir)).toEqual({ resultDisplay: "full" });
+    writeProject({ resultDisplay: "summary" } as any);
+    expect(loadSettings(projectDir)).toEqual({}); // invalid value dropped
+  });
+
   it("round-trips outputTranscript; drops non-boolean", () => {
     saveSettings({ outputTranscript: false }, projectDir);
     expect(loadSettings(projectDir)).toEqual({ outputTranscript: false });
@@ -548,6 +557,7 @@ describe("settings persistence", () => {
       setRememberAgents: vi.fn(),
         setWidgetMode: vi.fn(),
         setViewerMarkdown: vi.fn(),
+        setResultDisplay: vi.fn(),
         setOutputTranscript: vi.fn(),
         setWorktreeIsolation: vi.fn(),
         setMaxSubagentDepth: vi.fn(),
@@ -669,6 +679,13 @@ describe("settings persistence", () => {
       expect(appliers.setViewerMarkdown).toHaveBeenCalledWith("all");
       applySettings({}, appliers);
       expect(appliers.setViewerMarkdown).toHaveBeenCalledTimes(1); // absence is "use default"
+    });
+
+    it("applies resultDisplay; skips it when absent", () => {
+      applySettings({ resultDisplay: "collapsed" }, appliers);
+      expect(appliers.setResultDisplay).toHaveBeenCalledWith("collapsed");
+      applySettings({}, appliers);
+      expect(appliers.setResultDisplay).toHaveBeenCalledTimes(1); // absence is "use default"
     });
 
     it("applies fleetView (true and false); skips it when absent", () => {
@@ -799,6 +816,7 @@ describe("settings persistence", () => {
       setRememberAgents: vi.fn(),
         setWidgetMode: vi.fn(),
         setViewerMarkdown: vi.fn(),
+        setResultDisplay: vi.fn(),
         setOutputTranscript: vi.fn(),
         setWorktreeIsolation: vi.fn(),
         setMaxSubagentDepth: vi.fn(),

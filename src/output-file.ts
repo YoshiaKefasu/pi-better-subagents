@@ -6,9 +6,8 @@
  */
 
 import { appendFileSync, chmodSync, mkdirSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { AgentSession, AgentSessionEvent } from "@earendil-works/pi-coding-agent";
+import { type AgentSession, type AgentSessionEvent, getAgentDir } from "@earendil-works/pi-coding-agent";
 
 /**
  * Project/global default for writing a subagent's `.output` transcript; a custom
@@ -39,14 +38,29 @@ export function encodeCwd(cwd: string): string {
 
 /**
  * The per-session scratch directory, created if missing.
- * Mirrors Claude Code's layout: /tmp/{prefix}-{uid}/{encoded-cwd}/{sessionId}/tasks
+ * Mirrors Claude Code's layout: {root}/{encoded-cwd}/{sessionId}/tasks
+ *
+ * The root used to be `$TMPDIR/pi-subagents-<uid>` — completed agents'
+ * `.output` transcripts vanished whenever the OS swept Temp, and together
+ * with the in-memory GC that left no way back to a finished agent. The root
+ * is now fork-owned under pi's agent dir (`getAgentDir()/tmp/
+ * subagents-output`), which survives reboots and Temp sweeps. `tmp/` itself
+ * is shared space (created if missing, permissions untouched); only the
+ * fork-owned `subagents-output` root below it is tightened to owner-only
+ * `0700`, since transcripts hold full conversation text.
  *
  * Shared with the workflow tool, which persists each invocation's script here so
  * iterating on one is edit-file-then-rerun — the same convention, one directory.
+ *
+ * ディスク増加は緩やか: JSONL 追記のみでローテーションは pi 本体のセッション
+ * 保持方針に従う（古い Temp 側ファイルの移行はしない。新規分から新配置）。
  */
 export function sessionTaskDir(cwd: string, sessionId: string): string {
   const encoded = encodeCwd(cwd);
-  const root = join(tmpdir(), `pi-subagents-${process.getuid?.() ?? 0}`);
+  // getAgentDir()配下: fork 所有の tmp/subagents-output。tmp/ は他と共有し得る
+  // ため chmod しない（作るだけ）。0700 に締めるのは subagents-output 以下のみ。
+  mkdirSync(join(getAgentDir(), "tmp"), { recursive: true });
+  const root = join(getAgentDir(), "tmp", "subagents-output");
   mkdirSync(root, { recursive: true, mode: 0o700 });
   // chmod is a no-op on Windows and throws on some Windows filesystems.
   // On Unix we still want to enforce 0o700 past umask, so only swallow on Windows.

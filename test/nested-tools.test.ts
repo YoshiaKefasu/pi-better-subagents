@@ -9,6 +9,8 @@ import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager
 import { encodeCwd } from "../src/output-file.js";
 
 let cwd: string;
+let agentDir: string;
+let prevAgentDir: string | undefined;
 let manager: NestedAgentManager;
 let records: Map<string, any>;
 let spawn: ReturnType<typeof vi.fn>;
@@ -60,6 +62,11 @@ async function execute(tool: any, params: Record<string, unknown>, executionCwd 
 
 beforeEach(() => {
   cwd = mkdtempSync(join(tmpdir(), "nested-tools-test-"));
+  // Transcripts now live under the agent dir (not os tmpdir): redirect it so
+  // the run writes into a temp dir this file owns and removes afterwards.
+  prevAgentDir = process.env.PI_CODING_AGENT_DIR;
+  agentDir = mkdtempSync(join(tmpdir(), "nested-tools-agentdir-"));
+  process.env.PI_CODING_AGENT_DIR = agentDir;
   writeAgent("scout");
   writeAgent("reviewer");
   registerAgents(loadCustomAgents(cwd));
@@ -87,6 +94,9 @@ beforeEach(() => {
 afterEach(() => {
   setScopeModelsEnabled(false);
   rmSync(cwd, { recursive: true, force: true });
+  rmSync(agentDir, { recursive: true, force: true });
+  if (prevAgentDir == null) delete process.env.PI_CODING_AGENT_DIR;
+  else process.env.PI_CODING_AGENT_DIR = prevAgentDir;
 });
 
 describe("child-safe nested Agent tools", () => {
@@ -504,7 +514,7 @@ describe("child-safe nested Agent tools", () => {
     });
 
     // Real path construction (not mocked here), so clean up what it writes.
-    const transcriptRoot = join(tmpdir(), `pi-subagents-${process.getuid?.() ?? 0}`, encodeCwd(cwd));
+    const transcriptRoot = join(agentDir, "tmp", "subagents-output", encodeCwd(cwd));
     try {
       const [agent] = tools();
       await execute(agent, { subagent_type: "scout", description: "traced", prompt: "Do work" });

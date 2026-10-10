@@ -15,13 +15,16 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { statSync } from "node:fs";
-import { isAbsolute } from "node:path";
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { isAbsolute, join } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
-import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { type AgentSession, type ExtensionAPI, type ExtensionContext, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
 import { assignHandle, handleBase } from "./mention.js";
+import { isUpstreamUnreachableError, isUsageLimitError } from "./model-fallback-chain.js";
 import { describeModel } from "./model-resolver.js";
+import { dropNestedTodos } from "./nested-todos.js";
+import { loadSubagentsRetrySettings, type SubagentsRetrySettings } from "./subagents-retry-settings.js";
 import type { AgentInvocation, AgentRecord, AgentTombstone, IsolationMode, MentionResolution, SubagentType, ThinkingLevel } from "./types.js";
 import { addUsage, type LifetimeUsage } from "./usage.js";
 import type { CompiledSchema } from "./workflow/json-schema.js";
@@ -67,11 +70,24 @@ const DEFAULT_MAX_CONCURRENT = 10;
 const DEFAULT_MAX_CONCURRENT_FOREGROUND = 0;
 
 /**
- * How many evicted agents stay addressable by name. Only a bound on memory —
- * a session that spawns hundreds of agents shouldn't retain every one — and
- * far above the handful anyone keeps in their head.
+ * How many evicted agents stay addressable by name. Raised from 100 to 1000:
+ * a tombstone is a few hundred bytes of JSON (handle/alias/id/type/
+ * sessionFile/completedAt) and now also lives on disk, so holding a thousand
+ * costs ~100KB and survives session switches. The bound still exists so one
+ * runaway session cannot grow memory or the tombstone file without limit —
+ * see the unbounded-growth note in README (Session archive) before raising it.
  */
-const MAX_TOMBSTONES = 100;
+const MAX_TOMBSTONES = 1000;
+
+/**
+ * Fork-owned tombstone store, next to pi's own agent-dir files. Resolved via
+ * the existing `getAgentDir()` so tests (PI_CODING_AGENT_DIR) and real runs
+ * agree on the location. Deleted records are never removed from here except
+ * by explicit drop/clear or oldest-first cap eviction — never by GC or by a
+ * session switch — so a completed agent's conversation stays reopenable.
+ * ディスク増加は緩やか: tombstone 1件は数百バイト、1000件でも ~100KB 程度。
+ */
+const TOMBSTONE_FILE_NAME = "subagent-tombstones.json";
 
 /**
  * Validate a caller-supplied SpawnOptions.cwd. `undefined`/`null` mean "unset"
@@ -188,12 +204,23 @@ interface SpawnOptions {
    * `assignHandle` pass because tombstoned names are excluded from allocation
    * (`takenHandles`), so nothing live can be holding them.
    *
+   * `id` reuses the evicted record's ID so a resumed conversation keeps a
+   * stable identity. Reused only when no live record holds it (see `spawn`);
+   * execution metadata (`startedAt` etc.) is always fresh — only the ID is
+   * carried over, never the run state.
+   *
    * Internal capability, like `resumeSessionFile`: a forged handle would
    * duplicate a live agent's name and make `resolveMention` ambiguous, so
    * `spawnTopLevel` strips it from anything a caller sends.
    */
-  reclaim?: { handle: string; alias?: string };
+  reclaim?: { handle: string; alias?: string; id?: string };
   model?: Model<any>;
+  /**
+   * モデルフォールバック連鎖の残り（先頭を除く生文字列）。runAgent が切替時に
+   * 遅延解決する。Agent ツール / workflow の agent() / nested 呼び出しが
+   * parseModelChain で分解して渡す。カンマ無し指定では未設定。
+   */
+  modelFallbacks?: string[];
   maxTurns?: number;
   isolated?: boolean;
   inheritContext?: boolean;
@@ -332,6 +359,283 @@ interface ResumeOptions {
 /** Best-effort ceiling on one child's shutdown handlers, so teardown can't strand a quit. */
 const CHILD_SHUTDOWN_TIMEOUT_MS = 3_000;
 
+/** resolveRecord の id prefix 解決に必要な最低文字数。disk 側 (findSessionOnDisk・ID prefix) と同値。 */
+const MIN_ID_PREFIX_LEN = 6;
+
+const RETRYABLE_STREAM_ERRORS = [
+  "stream disconnected",
+  "stream ended",
+  "ended before",
+  "disconnected before completion",
+  "stream closed before response.completed",
+  "upstream execution failed",
+  // 以下はトランスポート層の切断。CPA側で実測された上流のTCP強制切断が該当する:
+  // `Post "https://.../v1/responses": read tcp ... wsarecv: An existing
+  // connection was forcibly closed by the remote host`。
+  // 会話自体は壊れていないため、同一セッションの継続として自動再送する。
+  "forcibly closed",
+  "connection reset",
+  "econnreset",
+  "econnaborted",
+  "connection aborted",
+  "socket hang up",
+  "broken pipe",
+  "epipe",
+  "read tcp",
+  "wsarecv",
+] as const;
+
+/**
+ * 接続確立失敗・タイムアウト系の一時的な通信断。該当すれば同一リクエストの
+ * 再送で通る見込みが高いため、stream 切断より厚い予算でリトライする。
+ * 文言の根拠: @earendil-works/pi-ai の dist/utils/retry.ts
+ * `RETRYABLE_PROVIDER_ERROR_PATTERN`（"fetch failed" / "ENOTFOUND" /
+ * "EAI_AGAIN" / "timed out" / "terminated" / "other side closed" 等）と
+ * Node/undici の実測エラー（ECONNREFUSED / ETIMEDOUT / UND_ERR_* 等）。
+ * 429・quota 系は含めない（使用制限はフォールバック連鎖の役目）。
+ * 照合は小文字化済みテキストへの部分一致のため小文字で書く。
+ */
+const TRANSIENT_RETRYABLE_ERRORS = [
+  "fetch failed",
+  "econnrefused",
+  "connection refused",
+  "etimedout",
+  "ehostunreach",
+  "host unreachable",
+  "ehostdown",
+  "enetunreach",
+  "network unreachable",
+  "enetdown",
+  "enetreset",
+  "enotfound",
+  "getaddrinfo",
+  "eai_again",
+  "upstream connect",
+  "reset before headers",
+  "socket connection was closed",
+  "connection lost",
+  "connection closed",
+  "connection error",
+  "network error",
+  "other side closed",
+  "premature close",
+  "tunnel",
+  "timed out",
+  // pi-ai の `timed? out` 対応: "timed out" では "time out"（例: "connect time out"）
+  // を拾えないため別途含める。
+  "time out",
+  "timeout",
+  "aborterror",
+  "the operation was aborted",
+  "request aborted",
+  "aborted",
+  "terminated",
+  "und_err",
+  "websocket closed",
+  "websocket error",
+  "connect timeout",
+  "idle timeout",
+  "connect_timeout",
+  "idle_timeout",
+  // pi-ai RETRYABLE_PROVIDER_ERROR_PATTERN 由来（実分類で NONE だった分のみ追記）。
+  "http2 request did not get a response",
+  "exceeded request buffer limit while retrying upstream",
+  "provider returned error",
+  "resourceexhausted",
+  // 一時的な TLS 再交渉失敗の可能性があるため残す。証明書自体の確定失敗は
+  // NON_TRANSIENT_CERT_ERRORS で先に弾く。
+  "handshake failure",
+] as const;
+
+/**
+ * 証明書系の確定失敗 — 同一リクエスト再送では絶対に回復しないため transient
+ * 対象外。isTransientRetryableFailure が TRANSIENT_RETRYABLE_ERRORS より先に
+ * 評価し、含めば false（none へ落とす）。`handshake failure` は含めない
+ * （一時的な再交渉失敗の可能性があるため transient に残す）。
+ * 照合は小文字化済みテキストへの部分一致のため小文字で書く。
+ */
+const NON_TRANSIENT_CERT_ERRORS = [
+  "certificate has expired",
+  "self signed certificate",
+  "self-signed certificate",
+  "unable to verify",
+  "certificate verify failed",
+  "unable to get local issuer certificate",
+  "unable to get issuer cert",
+  "wrong version number",
+] as const;
+
+function isRetryableStreamFailure(error: unknown): boolean {
+  return RETRYABLE_STREAM_ERRORS.some((needle) => retryableSearchText(error).includes(needle));
+}
+
+function isTransientRetryableFailure(error: unknown): boolean {
+  const text = retryableSearchText(error);
+  // 証明書系の確定失敗は再送しても回復しないため先に弾く（transient 対象外）。
+  // `handshake failure` は含めない（一時的な再交渉失敗の可能性があるため残す）。
+  if (NON_TRANSIENT_CERT_ERRORS.some((needle) => text.includes(needle))) return false;
+  return TRANSIENT_RETRYABLE_ERRORS.some((needle) => text.includes(needle));
+}
+
+/**
+ * cause チェーン内の数値ステータス（{ status: 429 } 等）を探す。
+ * retryableSearchText はメッセージ文字列だけを flatten するため、数値だけを
+ * 持つ cause オブジェクトは "[object Object]" に埋もれて 429 を見逃す。
+ * ここではメッセージ化せず、各ノードの STATUS_KEYS 相当を直接見る。
+ */
+function hasUsageLimitStatusInChain(error: unknown): boolean {
+  const seen = new Set<unknown>();
+  const stack: unknown[] = [error];
+  while (stack.length > 0) {
+    const cur = stack.pop();
+    if (cur == null || seen.has(cur)) continue;
+    seen.add(cur);
+    if (cur instanceof Error) {
+      const agg = (cur as AggregateError).errors;
+      if (Array.isArray(agg)) stack.push(...agg);
+      stack.push((cur as { cause?: unknown }).cause);
+    } else if (typeof cur === "object") {
+      const rec = cur as Record<string, unknown>;
+      for (const key of ["status", "statusCode", "status_code", "code"] as const) {
+        const value = rec[key];
+        if (value === 429 || value === "429") return true;
+      }
+      if ("cause" in rec) stack.push(rec.cause);
+      if (Array.isArray((rec as { errors?: unknown }).errors)) {
+        stack.push(...((rec as { errors?: unknown }).errors as unknown[]));
+      }
+    }
+  }
+  return false;
+}
+
+/** spawn 失敗の再送分類。429 を厚くリトライしないことが最優先の不変条件。 */
+export type RetryFailureFamily = "usage-limit" | "upstream" | "transient" | "stream" | "none";
+
+/**
+ * failure を再送方針に分類する純粋関数。優先順位は
+ * usage-limit > upstream > stream > transient > none。リストは重複し得る
+ * （例: "fetch failed / read ECONNRESET" は `econnreset` で stream が先に当たる）。
+ * stream を transient より先に評価して既存の挙動を優先している。
+ * `upstream` も stream / transient より先に判定する — 502 の実測文言
+ * （"502 | upstream execution failed: ... unreachable"）は両方の文言を
+ * 同時に含むため、stream を先だと同一モデルでの再送ループに入ってしまう。
+ * upstream は「同じモデルで粘らない。フォールバック連鎖へ委ねる」扱い。
+ * NOTE: model-fallback-chain.ts の classifyRetryFailure（agent-runner の
+ * own-retry/fallback/as-is 分岐用）とは名前も返り値も別物。混同注意。
+ */
+export function classifyRetryFailureFamily(failure: unknown): RetryFailureFamily {
+  // usage-limit 判定は flatten した全文に対しても走らせる。isUsageLimitError は
+  // トップレベルの message と数値 status しか見ないため、`Error("fetch failed") +
+  // cause:{status:429}` のように 429 が cause に埋まると見逃す。flatten テキストに
+  // "fetch failed" があっても 429 があれば usage-limit を優先する。
+  if (isUsageLimitError(failure)) return "usage-limit";
+  if (isUsageLimitError(retryableSearchText(failure))) return "usage-limit";
+  if (hasUsageLimitStatusInChain(failure)) return "usage-limit";
+  // 上流到達不能（502 等）。usage-limit と同じく同一モデルでの再送はしない。
+  if (isUpstreamUnreachableError(failure)) return "upstream";
+  if (isUpstreamUnreachableError(retryableSearchText(failure))) return "upstream";
+  if (isRetryableStreamFailure(failure)) return "stream";
+  if (isTransientRetryableFailure(failure)) return "transient";
+  return "none";
+}
+
+/**
+ * リトライ判定用の照合テキスト: error.message だけでなく `cause` チェーンを
+ * 再帰 flatten する (ラップされた提供者エラーに対応)。AggregateError の
+ * `errors` 配列も展開する。循環参照は seen で打ち切る。
+ */
+function retryableSearchText(error: unknown): string {
+  const parts: string[] = [];
+  const seen = new Set<unknown>();
+  const stack: unknown[] = [error];
+  while (stack.length > 0) {
+    const cur = stack.pop();
+    if (cur == null || seen.has(cur)) continue;
+    seen.add(cur);
+    if (cur instanceof Error) {
+      parts.push(cur.message);
+      // AggregateError.errors を先に積む (LIFO のため cause より後に読まれる)。
+      const agg = (cur as AggregateError).errors;
+      if (Array.isArray(agg)) stack.push(...agg);
+      stack.push((cur as { cause?: unknown }).cause);
+    } else if (typeof cur === "object") {
+      const rec = cur as Record<string, unknown>;
+      if ("cause" in rec) stack.push(rec.cause);
+      else parts.push(String(cur));
+    } else {
+      parts.push(String(cur));
+    }
+  }
+  return parts.join("\n").toLowerCase();
+}
+
+/**
+ * 中断対応の待機。agent-runner.ts の sleepAbortable と同一パターン。
+ * いずれかの signal が abort 済み／途中で abort されたら即 resolve する。
+ * 呼び出し後の abort ガードは残すこと（resolve 後に abort された場合のため）。
+ */
+function sleepAbortableMs(ms: number, signals: (AbortSignal | undefined)[]): Promise<void> {
+  if (ms <= 0) return Promise.resolve();
+  if (signals.some(signal => signal?.aborted === true)) return Promise.resolve();
+  return new Promise(resolve => {
+    const timer = setTimeout(done, ms);
+    function done(): void {
+      clearTimeout(timer);
+      for (const signal of signals) signal?.removeEventListener("abort", done);
+      resolve();
+    }
+    for (const signal of signals) signal?.addEventListener("abort", done, { once: true });
+  });
+}
+
+/**
+ * リトライ突入ゲート（.then / .catch 両経路で共有）。classifyRetryFailureFamily
+ * が usage-limit > upstream > stream > transient > none の順で判定済みのため、
+ * ここでは `!isUsageLimitError(...)` の再判定はしない（重複排除）。
+ * usage-limit と upstream は「同じモデルで粘らない」ためここでは false —
+ * フォールバック連鎖（runAgent 側）へ委ねる。
+ */
+function shouldRetry(
+  failure: unknown,
+  settings: SubagentsRetrySettings,
+  record: Pick<AgentRecord, "status">,
+  options: Pick<SpawnOptions, "structuredOutput">,
+): boolean {
+  if (!failure) return false;
+  if (!settings.enabled) return false;
+  if (options.structuredOutput) return false;
+  if (record.status === "stopped") return false;
+  const family = classifyRetryFailureFamily(failure);
+  if (family !== "stream" && family !== "transient") return false;
+  const budget = family === "transient" ? settings.transientMaxAttempts : settings.maxAttempts;
+  return budget > 1;
+}
+
+/**
+ * transient 再送の指数バックオフ: `transientBaseDelayMs * 2^(attempt-2)` を
+ * `transientBackoffCapMs` で頭打ちする。attempt=2（初回再送）は base のまま。
+ */
+function transientRetryDelayMs(settings: SubagentsRetrySettings, attempt: number): number {
+  const delay = settings.transientBaseDelayMs * 2 ** Math.max(0, attempt - 2);
+  const safeDelay = Number.isSafeInteger(delay) ? delay : Number.MAX_SAFE_INTEGER;
+  return Math.min(safeDelay, settings.transientBackoffCapMs);
+}
+
+/** failure（string | Error | その他）をログ・再送プロンプト用の文字列にする。 */
+function retryFailureText(failure: unknown): string {
+  return failure instanceof Error ? failure.message : String(failure);
+}
+
+/** 長文・複数行の failure をログ用に先頭1行へ丸める。 */
+function retryFailureHeadline(failure: string): string {
+  return failure.split("\n", 1)[0].slice(0, 200);
+}
+
+function isAgentStopped(record: Pick<AgentRecord, "status">): boolean {
+  return record.status === "stopped";
+}
+
 /**
  * Close the extension lifecycle `runAgent` opened with `bindExtensions`, then dispose.
  *
@@ -387,10 +691,15 @@ export class AgentManager {
   /**
    * Evicted agents that can still be reached by name, keyed by handle. Outlives
    * the 10-minute record cleanup — that timer exists to bound memory, not to
-   * expire a conversation the user might still want — and is cleared alongside
-   * completed records on session start/switch.
+   * expire a conversation the user might still want — and is KEPT across
+   * session start/switch: the store is mirrored to disk
+   * (`subagent-tombstones.json` under the agent dir), so an evicted agent
+   * stays reopenable in later sessions. Only explicit drops (dropTombstone /
+   * clearTombstones) or oldest-first cap eviction remove entries.
    */
   private tombstones = new Map<string, AgentTombstone>();
+  /** Disk mirror enabled via enableTombstonePersistence() (extension only). */
+  private tombstonePersistence = false;
 
   /**
    * Agents waiting to start, tagged with the pool they wait on. One queue for
@@ -424,6 +733,10 @@ export class AgentManager {
     this.onCompact = onCompact;
     this.onUsage = onUsage;
     this.maxConcurrent = maxConcurrent;
+    // NOTE: the disk mirror is NOT loaded here. Persistence is opt-in via
+    // enableTombstonePersistence() (the extension calls it; unit tests stay
+    // purely in-memory unless they opt in) so a bare manager can never read
+    // or write the developer's real store as a test side effect.
     // Cleanup completed agents after 10 minutes (but keep sessions for resume)
     this.cleanupInterval = setInterval(() => this.cleanup(), 60_000);
     this.cleanupInterval.unref();
@@ -498,7 +811,19 @@ export class AgentManager {
     // can fix and retry; the RPC layer converts throws into error envelopes.
     assertValidSpawnCwd(options.cwd);
 
-    const id = randomUUID().slice(0, 17);
+    // ID再利用: tombstone resume / disk reopen は会話ファイルを開き直した
+    // 新規レコードとして復活するため、復活元のIDを reclaim.id で引き継いで
+    // 会話の同一性を保つ。現存レコードと衝突する場合（同IDが生きている）は
+    // 従来通り新規採番する — ID重複は絶対に起こさない。tombstone は live
+    // レコードではないため再利用を妨げない（resume 成功後も tombstone は残る
+    // 仕様だが、id 解決は live の map のみ見るので衝突しない）。
+    // startedAt 等の実行メタは下の record 構築で常に新規にする — 引き継ぐのは
+    // ID だけであり、実行状態（result/error/completedAt 等）は持ち越さない。
+    const reclaimedId = options.reclaim?.id;
+    const id =
+      reclaimedId !== undefined && reclaimedId !== "" && !this.agents.has(reclaimedId)
+        ? reclaimedId
+        : randomUUID();
     const abortController = new AbortController();
     const record: AgentRecord = {
       id,
@@ -758,10 +1083,12 @@ export class AgentManager {
     }
     const detach = () => { detachParentSignal?.(); detachParentSignal = undefined; };
 
+    const retrySettings = loadSubagentsRetrySettings(options.configCwd ?? ctx.cwd);
     const promise = runAgent(ctx, type, prompt, {
       pi,
       agentId: id,
       model: options.model,
+      modelFallbacks: options.modelFallbacks,
       maxTurns: options.maxTurns,
       isolated: options.isolated,
       inheritContext: options.inheritContext,
@@ -847,6 +1174,38 @@ export class AgentManager {
       },
     })
       .then(async ({ responseText, session, aborted, steered, failure, structuredJson, structuredRetried }) => {
+        record.session = session;
+        // フォールバックでモデルが切り替わっていたら表示を追随させる
+        // （onSessionCreated 時のスナップショットは切替前のモデルのままなため）。
+        // describeModel の2キーのみ上書きし、requested* は残す。
+        // session 自体が無い（起動失敗のモック等）場合は何もしない。
+        if (session?.model) {
+          record.invocation ??= {};
+          Object.assign(record.invocation, describeModel(session.model));
+        }
+        let finalResponseText = responseText;
+        let finalFailure = failure;
+        // 判定の優先順位：classifyRetryFailureFamily（usage-limit > upstream > stream / transient > none）。
+        // 429 系・502 系はリトライに回さない — runAgent 内でフォールバック
+        // 済み（枯渇時を含む）のため、ここで同一モデルに粘ると CPA 側の
+        // クールダウンを汚染する。RETRYABLE_STREAM_ERRORS 側に 429 系の
+        // 文言が混ざっていないことも確認済み（混ざれば除外する方針）。
+        // structured 期待の spawn は stream リトライの対象外: retry は
+        // schema の無い resumeAgent で継続するため、成功しても
+        // structuredJson が古いまま completed になり schema 契約が崩れる。
+        // 選択肢 (b) の再取得ではなく (a) 除外を選んだ理由は、再取得には
+        // runner の resume 結果への schema 適用が必要で、agent-runner 側の
+        // 変更になるため (本ラウンドの対象外)。
+        // 再送予算は family 別：transient（通信断）は stream 切断より厚く粘る。
+        if (shouldRetry(failure, retrySettings, record, options)) {
+          const retryResult = await this.retryStreamFailure(record, retrySettings, options.signal, failure, options);
+          if (retryResult.succeeded) {
+            finalResponseText = retryResult.text;
+            finalFailure = undefined;
+          } else {
+            finalFailure = retryResult.failure;
+          }
+        }
         // Don't overwrite status if externally stopped via abort()
         if (record.status !== "stopped") {
           // Precedence: a hard abort keeps "aborted"; then a failed final turn
@@ -854,14 +1213,15 @@ export class AgentManager {
           // honest "error" — not a completion with an empty or stale result.
           if (aborted) {
             record.status = "aborted";
-          } else if (failure) {
+          } else if (finalFailure) {
             record.status = "error";
-            record.error = failure;
+            record.error = finalFailure;
           } else {
             record.status = steered ? "steered" : "completed";
+            record.error = undefined;
           }
         }
-        record.result = responseText;
+        record.result = finalResponseText;
         // Kept beside `result`, never inside it: `result` is prose meant for a
         // reader — it is previewed, transcribed, and appended to below — while
         // this is a machine-readable payload one caller asked for by schema.
@@ -872,42 +1232,35 @@ export class AgentManager {
 
         detach();
 
-        // Final flush of streaming output file
-        if (record.outputCleanup) {
-          try { record.outputCleanup(); } catch { /* ignore */ }
-          record.outputCleanup = undefined;
-        }
-
-        // Clean up worktree if used
-        if (record.worktree) {
-          // The one moment the child's tree still exists and the child is done
-          // writing to it. try/catch, not decoration: a hook that throws must
-          // not leave the worktree behind.
-          if (options.onBeforeWorktreeCleanup) {
-            try {
-              await options.onBeforeWorktreeCleanup(record.worktree.path);
-            } catch { /* ignore — never block cleanup */ }
-          }
-          const wtResult = await cleanupWorktree(pi, baseCwd, record.worktree, options.description);
-          record.worktreeResult = wtResult;
-          if (wtResult.hasChanges && wtResult.branch) {
-            // With a caller-supplied cwd the branch lives in THAT repo, not the
-            // parent session's — say so, or the orchestrator merges in the wrong repo.
-            const repoNote = customCwd !== undefined ? ` in \`${baseCwd}\`` : "";
-            // Appended to the prose only. A structured child's caller parses
-            // `structuredJson`, which stays untouched — but `result` is also
-            // what a human reads, so the note still belongs on it.
-            record.result = (record.result ?? "") +
-              `\n\n---\nChanges saved to branch \`${wtResult.branch}\`${repoNote}. Merge with: \`git merge ${wtResult.branch}\`${customCwd !== undefined ? ` (run in \`${baseCwd}\`)` : ""}`;
-          }
-        }
-
-        this.abortOwnedChildren(id);
-
-        this.settleRun(record, true, pool);
+        await this.settleSpawnSuccess(record, { id, pi, baseCwd, customCwd, options, pool });
         return responseText;
       })
       .catch(async (err) => {
+        let retrySucceeded = false;
+        // .then 側と同じゲート（shouldRetry に一本化）。429 系はリトライ対象外。
+        if (shouldRetry(err, retrySettings, record, options)) {
+          const retryResult = await this.retryStreamFailure(record, retrySettings, options.signal, err, options);
+          if (retryResult.succeeded) {
+            retrySucceeded = true;
+            record.status = "completed";
+            record.error = undefined;
+            record.result = retryResult.text;
+            record.completedAt ??= Date.now();
+          } else {
+            err = new Error(retryResult.failure);
+          }
+        }
+
+        if (retrySucceeded) {
+          detach();
+          // .then 側と同一の成功 tail。旧コードの外側 try/catch を維持:
+          // cleanupWorktree の throw はここでは飲み込む (従来通り)。
+          try {
+            await this.settleSpawnSuccess(record, { id, pi, baseCwd, customCwd, options, pool });
+          } catch { /* ignore cleanup errors */ }
+          return record.result ?? "";
+        }
+
         // Don't overwrite status if externally stopped via abort()
         if (record.status !== "stopped") {
           record.status = "error";
@@ -945,6 +1298,179 @@ export class AgentManager {
     // starts. Read off the options, so a spawn that started from a queue drain
     // still reaches the caller that queued it.
     options.onSpawned?.(id);
+  }
+
+  private async retryStreamFailure(
+    record: AgentRecord,
+    settings: SubagentsRetrySettings,
+    parentSignal: AbortSignal | undefined,
+    initialFailure: unknown,
+    options: SpawnOptions,
+  ): Promise<{ succeeded: true; text: string } | { succeeded: false; failure: string }> {
+    const session = record.session;
+    if (!session) return { succeeded: false, failure: retryFailureText(initialFailure) };
+
+    // 再送予算は突入時の family で固定する（途中で文言が変わっても予算は変えない）。
+    const family = classifyRetryFailureFamily(initialFailure);
+    if (family !== "stream" && family !== "transient") {
+      return { succeeded: false, failure: retryFailureText(initialFailure) };
+    }
+    const maxAttempts = family === "transient" ? settings.transientMaxAttempts : settings.maxAttempts;
+    const startedAt = Date.now();
+    const elapsedExceeded = (): boolean =>
+      settings.maxElapsedMs > 0 && Date.now() - startedAt >= settings.maxElapsedMs;
+
+    let lastFailure = retryFailureText(initialFailure);
+    console.warn(
+      `[pi-subagents] Retrying ${family} failure (attempt 1/${maxAttempts}): ${retryFailureHeadline(lastFailure)}`,
+    );
+    for (let attempt = 2; attempt <= maxAttempts; attempt++) {
+      if (isAgentStopped(record) || record.abortController?.signal.aborted || parentSignal?.aborted) {
+        return { succeeded: false, failure: lastFailure };
+      }
+      if (elapsedExceeded()) break;
+      // parentSignal と record 側のどちらかが abort されたら即 resolve（最大60秒の
+      // ブロッキングを避ける）。sleep 後のガードは残す（resolve 後に abort の場合）。
+      await sleepAbortableMs(
+        family === "transient" ? transientRetryDelayMs(settings, attempt) : settings.baseDelayMs,
+        [parentSignal, record.abortController?.signal],
+      );
+      if (isAgentStopped(record) || record.abortController?.signal.aborted || parentSignal?.aborted) {
+        return { succeeded: false, failure: lastFailure };
+      }
+      if (elapsedExceeded()) break;
+
+      try {
+        // リトライ時は元プロンプトではなく、エラー内容を含んだ継続指示を送る。
+        // これにより「同じプロンプトが再送される」問題を防ぎ、かつエージェントに
+        // 「途中で切れた、続けて」という文脈を伝える。ユーザーからは、裏で steer 相当の
+        // 再送が走って会話が継続する (「メッセージ送信で自動再開」) ように見える。
+        // 冪等性の注意: 完了済みの tool 実行はセッション履歴に残るため再実行されないが、
+        // 切断時に実行中だった tool はサーバ側で実行済みの可能性があり、再開ターンで
+        // モデルが重複実行することがある。非冪等な操作の扱いはモデルの判断に委ねられる。
+        // 長い cause チェーンで再送プロンプトが肥大化しないよう 200 字に截断。
+        const failureSnippet = lastFailure.slice(0, 200);
+        const retryPrompt = family === "transient"
+          ? `（通信が切断されました。エラー: ${failureSnippet}）\n続きを進めてください。`
+          : `（ストリーム接続が切れました。エラー: ${failureSnippet}）\n続きを進めてください。`;
+        const result = await resumeAgent(session, retryPrompt, {
+          signal: record.abortController?.signal,
+          onToolActivity: (activity) => {
+            if (activity.type === "end") record.toolUses++;
+            options.onToolActivity?.(activity);
+          },
+          onAssistantUsage: (usage) => {
+            addUsage(record.lifetimeUsage, usage);
+            this.onUsage?.(record, usage);
+            options.onAssistantUsage?.(usage);
+          },
+          onCompaction: (info) => {
+            record.compactionCount++;
+            this.onCompact?.(record, info);
+            options.onCompaction?.(info);
+          },
+        });
+        if (!result.failure) {
+          record.status = "completed";
+          record.error = undefined;
+          record.result = result.text;
+          record.completedAt = Date.now();
+          this.abortOwnedChildren(record.id);
+          return { succeeded: true, text: result.text };
+        }
+        lastFailure = result.failure;
+        // 429 系・上流到達不能はリトライを打ち切る（同一モデルで粘らない）。
+        // フォールバックは runAgent の役目であり、ここでは回数消費だけになるため。
+        const nextFamily = classifyRetryFailureFamily(result.failure);
+        if (nextFamily === "usage-limit" || nextFamily === "upstream") {
+          console.warn(`[pi-subagents] Stopping retry: failure changed to ${nextFamily}; leaving it to the model fallback chain.`);
+          record.error = lastFailure;
+          return { succeeded: false, failure: lastFailure };
+        }
+        if (nextFamily !== "stream" && nextFamily !== "transient") break;
+      } catch (error) {
+        lastFailure = retryFailureText(error);
+        // throw されたエラーも同様：429 系・502 系ならリトライを打ち切る。
+        const caughtFamily = classifyRetryFailureFamily(error);
+        if (caughtFamily === "usage-limit" || caughtFamily === "upstream") {
+          console.warn(`[pi-subagents] Stopping retry: failure changed to ${caughtFamily}; leaving it to the model fallback chain.`);
+          record.error = lastFailure;
+          return { succeeded: false, failure: lastFailure };
+        }
+        if (caughtFamily !== "stream" && caughtFamily !== "transient") break;
+      }
+    }
+
+    // 回数切れと時間切れを区別してログ出す（同じ文言だと原因切り分けができない）。
+    if (elapsedExceeded()) {
+      console.warn(
+        `[pi-subagents] Giving up retry after exceeding the ${family} time budget (${settings.maxElapsedMs}ms): ${retryFailureHeadline(lastFailure)}`,
+      );
+    } else {
+      console.warn(
+        `[pi-subagents] Giving up retry after exceeding the ${family} attempt budget (${maxAttempts} attempts): ${retryFailureHeadline(lastFailure)}`,
+      );
+    }
+    record.error = lastFailure;
+    return { succeeded: false, failure: lastFailure };
+  }
+
+  /**
+   * The shared tail of the two SUCCESS settle paths (normal completion and
+   * retry-recovered): flush the transcript, clean up the worktree with its
+   * branch note, release the pool slot and notify. The error tail stays
+   * separate — it settles `false`, skips the hook and the branch note.
+   *
+   * A `cleanupWorktree` throw propagates, exactly as the normal path always
+   * did; the retry-recovered caller wraps this in try/catch to keep its
+   * historical swallow. Neither this helper nor its callers touch the model
+   * fallback chain — that lives in runAgent and the `isUsageLimitError` gate
+   * above, both outside this tail.
+   */
+  private async settleSpawnSuccess(
+    record: AgentRecord,
+    ctx: {
+      id: string;
+      pi: ExtensionAPI;
+      baseCwd: string;
+      customCwd: string | undefined;
+      options: Pick<SpawnOptions, "description" | "onBeforeWorktreeCleanup">;
+      pool: Pool | undefined;
+    },
+  ): Promise<void> {
+    // Final flush of streaming output file
+    if (record.outputCleanup) {
+      try { record.outputCleanup(); } catch { /* ignore */ }
+      record.outputCleanup = undefined;
+    }
+
+    // Clean up worktree if used
+    if (record.worktree) {
+      // The one moment the child's tree still exists and the child is done
+      // writing to it. try/catch, not decoration: a hook that throws must
+      // not leave the worktree behind.
+      if (ctx.options.onBeforeWorktreeCleanup) {
+        try {
+          await ctx.options.onBeforeWorktreeCleanup(record.worktree.path);
+        } catch { /* ignore — never block cleanup */ }
+      }
+      const wtResult = await cleanupWorktree(ctx.pi, ctx.baseCwd, record.worktree, ctx.options.description);
+      record.worktreeResult = wtResult;
+      if (wtResult.hasChanges && wtResult.branch) {
+        // With a caller-supplied cwd the branch lives in THAT repo, not the
+        // parent session's — say so, or the orchestrator merges in the wrong repo.
+        const repoNote = ctx.customCwd !== undefined ? ` in \`${ctx.baseCwd}\`` : "";
+        // Appended to the prose only. A structured child's caller parses
+        // `structuredJson`, which stays untouched — but `result` is also
+        // what a human reads, so the note still belongs on it.
+        record.result = (record.result ?? "") +
+          `\n\n---\nChanges saved to branch \`${wtResult.branch}\`${repoNote}. Merge with: \`git merge ${wtResult.branch}\`${ctx.customCwd !== undefined ? ` (run in \`${ctx.baseCwd}\`)` : ""}`;
+      }
+    }
+
+    this.abortOwnedChildren(ctx.id);
+
+    this.settleRun(record, true, ctx.pool);
   }
 
   /**
@@ -1333,6 +1859,38 @@ export class AgentManager {
     return this.agents.get(id);
   }
 
+  /**
+   * Resolve an agent by exact id, handle/alias, or unique id prefix.
+   * Lets callers resume with a short id (e.g. first 8-16 chars from a
+   * notification) instead of the full UUID. Returns undefined when there
+   * is no match or the prefix is ambiguous.
+   *
+   * id prefix は最低6文字を要求する（1文字解決の誤爆防止）。disk 側
+   * findSessionOnDisk の ID prefix 側も6文字（hashPart 側は4文字）、stop 側の
+   * 文書は 8+ 文字推奨のため、6文字 floor はどちらとも整合する。
+   * handle/alias 照合には floor を掛けない（短い名前は正規の指定のため）。
+   */
+  resolveRecord(id: string): AgentRecord | undefined {
+    const exact = this.agents.get(id);
+    if (exact) return exact;
+    const wanted = id.toLowerCase();
+    for (const record of this.agents.values()) {
+      if (record.handle?.toLowerCase() === wanted || record.alias?.toLowerCase() === wanted) {
+        return record;
+      }
+    }
+    // 短すぎる prefix は曖昧さ以前に受け付けない（空文字の1件ヒット等を防ぐ）。
+    if (wanted.length < MIN_ID_PREFIX_LEN) return undefined;
+    let match: AgentRecord | undefined;
+    for (const record of this.agents.values()) {
+      if (record.id.toLowerCase().startsWith(wanted)) {
+        if (match) return undefined; // ambiguous
+        match = record;
+      }
+    }
+    return match;
+  }
+
   /** Handles already in use, so a fresh spawn can pick an unclaimed one. */
   private takenHandles(): Set<string> {
     const taken = new Set<string>();
@@ -1391,6 +1949,9 @@ export class AgentManager {
    */
   dropTombstone(handle: string): void {
     this.tombstones.delete(handle);
+    // tombstone と同一キーで保持していた ToDo もここで破棄する。
+    dropNestedTodos(handle);
+    this.persistTombstones();
   }
 
   /** Evicted agents whose conversation can still be reopened, newest first. */
@@ -1428,6 +1989,10 @@ export class AgentManager {
   /** Dispose a record's session and remove it from the map. */
   private removeRecord(id: string, record: AgentRecord): void {
     this.tombstone(record);
+    // tombstone 化されなかったレコード（handle の無い nested/workflow 子等）の
+    // ToDo は後段の破棄点が無いのでここで破棄する。tombstone 化された側は
+    // handle キーのまま生き残り、tombstone 破棄時に連動して消える。
+    if (!record.handle) dropNestedTodos(record.id);
     const session = record.session;
     // Detached before the shutdown starts, so the record leaves the map at once and
     // nothing can observe a session that is half torn down.
@@ -1444,12 +2009,16 @@ export class AgentManager {
 
   /**
    * Preserve enough of a departing record for `@handle` to reopen its
-   * conversation later. Nothing to keep unless it has both a handle to be
-   * addressed by and a session file to reopen — an in-memory session leaves no
-   * transcript, so the mention would have nothing to continue from.
+   * conversation later. Every record WITH a handle is kept — including one
+   * whose session was never persisted (`sessionFile` undefined): such an entry
+   * cannot be reopened (the resume paths require a session file), but it still
+   * holds the name against shadowing and stays visible in the evicted list, so
+   * GC never silently discards a finished agent. Records without a handle
+   * (nested/workflow children) have nothing anyone could address them by, so
+   * there is nothing to keep — those return without writing.
    */
   private tombstone(record: AgentRecord): void {
-    if (!record.handle || !record.sessionFile) return;
+    if (!record.handle) return;
     this.tombstones.set(record.handle, {
       handle: record.handle,
       alias: record.alias,
@@ -1464,6 +2033,91 @@ export class AgentManager {
     while (this.tombstones.size > MAX_TOMBSTONES) {
       const oldest = [...this.tombstones.values()].reduce((a, b) => (a.completedAt <= b.completedAt ? a : b));
       this.tombstones.delete(oldest.handle);
+      // 上限追い出し: tombstone と同一キーで保持していた ToDo も破棄する。
+      dropNestedTodos(oldest.handle);
+    }
+    this.persistTombstones();
+  }
+
+  /**
+   * Enable the disk mirror of tombstones (`subagent-tombstones.json` under
+   * the agent dir): reloads entries persisted by an earlier process, then
+   * persists on every later mutation. Called once by the extension right after
+   * construction — a bare manager stays purely in-memory, so unit tests never
+   * touch the developer's real store unless they opt in explicitly.
+   */
+  enableTombstonePersistence(): void {
+    this.tombstonePersistence = true;
+    // Disk-persisted tombstones outlive the process: reload them so a restart
+    // or a new activation keeps every evicted agent reopenable. A corrupt
+    // file reads as empty (never a startup failure) — see loadTombstones.
+    this.loadTombstones();
+  }
+
+  /** Fork-owned tombstone file: `<agentDir>/subagent-tombstones.json`. */
+  private tombstoneFile(): string | undefined {
+    try {
+      return join(getAgentDir(), TOMBSTONE_FILE_NAME);
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Best-effort mirror of the in-memory tombstones to disk. Called after every
+   * mutation (add, cap eviction, drop, clear) so a crash or a session switch
+   * never loses an evicted agent. Sync and small (≤1000 tiny entries) — this
+   * runs on eviction paths only, never per message. Failures are swallowed: a
+   * tombstone store that cannot be written must not take down the session.
+   * No-op unless enableTombstonePersistence() was called, so unit-test
+   * managers stay off disk.
+   */
+  private persistTombstones(): void {
+    if (!this.tombstonePersistence) return;
+    const file = this.tombstoneFile();
+    if (!file) return;
+    try {
+      mkdirSync(join(getAgentDir()), { recursive: true });
+      writeFileSync(file, JSON.stringify([...this.tombstones.values()]), "utf-8");
+    } catch {
+      /* best-effort — memory still holds the entries for this process */
+    }
+  }
+
+  /**
+   * Reload tombstones persisted by an earlier process. Shape-validated field
+   * by field; anything unreadable, unparseable, or misshapen reads as empty —
+   * a corrupt store must never fail startup. Entries past the cap are dropped
+   * oldest-first, same as the live eviction order.
+   */
+  private loadTombstones(): void {
+    const file = this.tombstoneFile();
+    if (!file || !existsSync(file)) return;
+    try {
+      const raw: unknown = JSON.parse(readFileSync(file, "utf-8"));
+      if (!Array.isArray(raw)) return;
+      const loaded: AgentTombstone[] = [];
+      for (const item of raw) {
+        if (typeof item !== "object" || item === null) continue;
+        const rec = item as Record<string, unknown>;
+        if (typeof rec.handle !== "string" || typeof rec.id !== "string") continue;
+        if (typeof rec.completedAt !== "number") continue;
+        loaded.push({
+          handle: rec.handle,
+          alias: typeof rec.alias === "string" ? rec.alias : undefined,
+          id: rec.id,
+          type: typeof rec.type === "string" ? (rec.type as AgentTombstone["type"]) : "general-purpose",
+          description: typeof rec.description === "string" ? rec.description : "",
+          sessionFile: typeof rec.sessionFile === "string" ? rec.sessionFile : undefined,
+          completedAt: rec.completedAt,
+        });
+      }
+      loaded.sort((a, b) => b.completedAt - a.completedAt);
+      for (const entry of loaded.slice(0, MAX_TOMBSTONES)) {
+        this.tombstones.set(entry.handle, entry);
+      }
+    } catch {
+      /* corrupt file — start empty, the next persist overwrites it */
     }
   }
 
@@ -1477,10 +2131,15 @@ export class AgentManager {
   }
 
   /**
-   * Remove all completed/stopped/errored records immediately.
-   * Called on session start/switch so tasks from a prior session don't persist.
-   * Pass skipUnconsumed=true to preserve records the LLM hasn't read yet
-   * (resultConsumed=false) — they will be evicted by the 10-minute cleanup timer instead.
+   * Remove all completed/stopped/errored records immediately. Evicted records
+   * are tombstoned (and persisted) as usual, and tombstones are KEPT across
+   * the call: both callers are session boundaries (`session_start` and
+   * `session_before_switch`), and since tombstones went durable an evicted
+   * agent stays reopenable in the next session. Pass skipUnconsumed=true to
+   * preserve records the LLM hasn't read yet (resultConsumed=false) — they
+   * will be evicted by the 10-minute cleanup timer instead.
+   *
+   * 明示の削除は dropTombstone（1件）/ clearTombstones（全件）を使うこと。
    */
   clearCompleted(skipUnconsumed = false): void {
     for (const [id, record] of this.agents) {
@@ -1488,13 +2147,22 @@ export class AgentManager {
       if (skipUnconsumed && !record.resultConsumed) continue;
       this.removeRecord(id, record);
     }
-    // Unconditional: both callers are session boundaries (`session_start` and
-    // `session_before_switch`), and `skipUnconsumed` only spares records whose
-    // results the LLM has yet to read — it does not make the sweep partial in
-    // the sense that matters here. A new session means new handles, or
-    // `@explore` would silently reach an agent the user never started. Claude
-    // Code resets its registry on `/clear` for the same reason.
+    // tombstone は消さない: セッション切替・/new での無条件全消去をやめ、
+    // ディスク永続化した tombstone はセッションを跨いで保持する。生き残り
+    // レコード（running/queued、skipUnconsumed で温存された分）の ToDo と、
+    // 保持される tombstone 配下の ToDo には触らない。
+  }
+
+  /**
+   * Forget every evicted agent, by explicit request. The only path that wipes
+   * tombstones in bulk — GC, session switches, and `/new` deliberately keep
+   * them (see clearCompleted). Drops the linked nested ToDos and persists the
+   * now-empty store.
+   */
+  clearTombstones(): void {
+    for (const handle of this.tombstones.keys()) dropNestedTodos(handle);
     this.tombstones.clear();
+    this.persistTombstones();
   }
 
   /** Whether any agents are still running or queued. */

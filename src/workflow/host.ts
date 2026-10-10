@@ -36,6 +36,7 @@ import { existsSync } from "node:fs";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AgentManager } from "../agent-manager.js";
 import { getAgentConfig, resolveSpawnType } from "../agent-types.js";
+import { parseModelChain } from "../model-fallback-chain.js";
 import { resolveModel } from "../model-resolver.js";
 import { checkModelScope } from "../model-scope.js";
 import type { AgentRecord, ThinkingLevel } from "../types.js";
@@ -201,15 +202,19 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
       // definition's is next, and the parent's is the floor. A model the script
       // named and we cannot resolve is an error; one the definition named falls
       // back to the parent silently, because the script never asked for it.
+      // カンマ連鎖時は先頭のみ解決し、残りはフォールバック先として渡す。
       let model = ctx.model;
+      let modelFallbacks: string[] | undefined;
       const config = getAgentConfig(dispatch.type);
       const modelInput = request.model ?? config?.model;
       if (modelInput !== undefined) {
-        const resolved = resolveModel(modelInput, ctx.modelRegistry);
+        const chain = parseModelChain(modelInput);
+        const resolved = resolveModel(chain[0] ?? modelInput, ctx.modelRegistry);
         if (typeof resolved === "string") {
           if (request.model !== undefined) return { ok: false, error: resolved };
         } else {
           model = resolved;
+          if (chain.length > 1) modelFallbacks = chain.slice(1);
         }
       }
 
@@ -306,6 +311,7 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
             // never queued behind it.
             ...(deps.workflowId !== undefined ? { workflowId: deps.workflowId } : {}),
             ...(model !== undefined ? { model } : {}),
+            ...(modelFallbacks !== undefined ? { modelFallbacks } : {}),
             // Validated worker-side against the same list pi accepts, so the
             // cast asserts what the boundary has already checked. Left unset,
             // the agent definition's `thinking` (then the parent's) still wins —

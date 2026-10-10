@@ -14,7 +14,7 @@
 import { Editor, isKeyRelease, Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { hasAgentBadge, renderAgentName } from "../agent-color.js";
 import { type AgentManager, isTopLevelAgent } from "../agent-manager.js";
-import type { AgentRecord, ViewerMarkdownMode } from "../types.js";
+import type { AgentRecord, ResultDisplayMode, ViewerMarkdownMode } from "../types.js";
 import { getLifetimeCost, getLifetimeTotal } from "../usage.js";
 import { type AgentActivity, formatCost, type Theme } from "./agent-widget.js";
 import { ConversationViewer, VIEWPORT_HEIGHT_PCT } from "./conversation-viewer.js";
@@ -144,6 +144,10 @@ export class FleetList {
      * point. Omitted → `m` still cycles, viewer-locally.
      */
     private onViewerMarkdown?: (mode: ViewerMarkdownMode) => void,
+    /** The user's `resultDisplay` setting, for conversation overlays opened here. */
+    private resultDisplay?: () => ResultDisplayMode,
+    /** Persist a mode chosen with `r` in the conversation overlay. */
+    private onResultDisplay?: (mode: ResultDisplayMode) => void,
   ) {}
 
   // ---- Lifecycle ----
@@ -425,6 +429,8 @@ export class FleetList {
           this.showCost(),
           this.viewerMarkdown,
           this.onViewerMarkdown,
+          this.resultDisplay,
+          this.onResultDisplay,
         );
       },
       {

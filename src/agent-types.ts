@@ -14,11 +14,16 @@ import type { AgentConfig } from "./types.js";
  * than hardcoded so the set tracks pi-mono if it adds/renames a built-in.
  * `createCodingTools` → read/bash/edit/write; `createReadOnlyTools` →
  * read/grep/find/ls; their de-duplicated union is the 7 built-ins
- * (read, bash, edit, write, grep, find, ls). The `cwd` only binds tool
+ * (read, bash, edit, write, grep, find, ls). In addition, the built-in extension
+ * tools `codemode` (script runner) and `tool_search` (declares deferred tools
+ * such as `mcp__*` to the model) are treated as declarable built-in names in
+ * `tools:`. The `cwd` only binds tool
  * operations we never invoke here — we read each tool's `.name` and discard it.
  */
 export const BUILTIN_TOOL_NAMES: string[] = [
   ...new Set([...createCodingTools("."), ...createReadOnlyTools(".")].map((t) => t.name)),
+  "codemode",
+  "tool_search",
 ];
 
 /** Unified runtime registry of all agents (defaults + user-defined). */

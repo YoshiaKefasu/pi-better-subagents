@@ -226,16 +226,18 @@ Individual agent results render Claude Code-style in the conversation:
 
 Completed results can be expanded (ctrl+o in pi) to show the full agent output inline.
 
-By default, foreground and background agents each stream their full conversation to a per-subagent transcript — a JSON-lines file at `<os-tmpdir>/pi-subagents-<uid>/<cwd>/<session>/tasks/<agent-id>.output` (owner-only `0700`, cleared on reboot). Set `output_transcript: false` on a custom agent to write no transcript path or file for it, or set `outputTranscript: false` in `subagents.json` to make transcripts opt-in for the whole project (frontmatter overrides the project default). This governs **only** the transcript: it is independent of `persist_session` (the pi session on disk), and it does not affect `isolation: worktree` (which commits the agent's work to a git branch) or `memory:` (durable files) — set those accordingly if the goal is to keep a run off disk entirely. Background agent completion notifications render as styled boxes:
+By default, foreground and background agents each stream their full conversation to a per-subagent transcript — a JSON-lines file at `<agentDir>/tmp/subagents-output/<cwd>/<session>/tasks/<agent-id>.output` (owner-only `0700`, survives reboots and OS temp sweeps — it used to live under `<os-tmpdir>/pi-subagents-<uid>`, where a sweep could delete a finished agent's only remaining transcript). Set `output_transcript: false` on a custom agent to write no transcript path or file for it, or set `outputTranscript: false` in `subagents.json` to make transcripts opt-in for the whole project (frontmatter overrides the project default). This governs **only** the transcript: it is independent of `persist_session` (the pi session on disk), and it does not affect `isolation: worktree` (which commits the agent's work to a git branch) or `memory:` (durable files) — set those accordingly if the goal is to keep a run off disk entirely. Disk growth is gradual: transcripts are append-only JSONL and follow pi's own session-retention policy. Background agent completion notifications render as styled boxes:
 
 ```
 ✓ Find auth files completed
   ↻3 · 3 tool uses · 12.4k token · 4.1s
   ⎿  Found 5 files related to authentication...
-  transcript: /tmp/pi-subagents-501/home-user-project/sess-1/tasks/agent-abc123.output
+  transcript: ~/.pi/agent/tmp/subagents-output/home-user-project/sess-1/tasks/agent-abc123.output
 ```
 
 Group completions render each agent as a separate block. The LLM receives structured `<task-notification>` XML for parsing, while the user sees the themed visual.
+
+A stream-interrupted turn that is automatically retried keeps streaming into the same `.output` file: the retry re-prompts the live session while the run's subscription is still attached, so the continuation lands in the transcript like any other turn (flushed per `turn_end`, with a final flush at settle).
 
 ## Default Agent Types
 
@@ -629,7 +631,7 @@ Runtime tuning values set via `/agents` → Settings (max concurrency, max foreg
 
 **Background by default** (`backgroundByDefault`, default `true`): what an `Agent` call that doesn't say means. On — following Claude Code — the agent runs detached, the call returns its ID immediately, and a completion notification carries a preview of the result (`get_subagent_result` for the full text). Set `false` to restore the previous behaviour, where an unqualified spawn blocked the turn and returned its output inline. An explicit `run_in_background` on the call, or in an agent file's frontmatter, overrides this in both directions; the setting only decides what "unspecified" means. **Top-level only** — a nested spawn (an agent spawning its own) always defaults to foreground, because a detached child is stopped when its parent settles and has no notification path of its own. Toggle via `/agents → Settings → Background by default`; applied live.
 
-**Remember agents** (`rememberAgents`, default `true`): whether subagents persist their pi session, which is what lets [`@handle`](#agent-mentions) reopen an agent's conversation after its in-memory record has been evicted. Two visible consequences of the default: top-level subagents write a session file, and they nest under the session that spawned them in pi's `/resume`. Agents spawned by another agent are excluded — they get no handle, so nothing could reopen their transcript. A custom agent's `persist_session` frontmatter overrides this per agent, in both directions. Toggle via `/agents → Settings → Remember agents`; with it off, handles expire with their record (roughly ten minutes past completion) and `@explore` then starts a fresh agent rather than resuming — the behaviour before this setting existed.
+**Remember agents** (`rememberAgents`, default `true`): whether subagents persist their pi session, which is what lets [`@handle`](#agent-mentions) reopen an agent's conversation after its in-memory record has been evicted. Two visible consequences of the default: top-level subagents write a session file, and they nest under the session that spawned them in pi's `/resume`. Agents spawned by another agent are excluded — they get no handle, so nothing could reopen their transcript. A custom agent's `persist_session` frontmatter overrides this per agent, in both directions. Toggle via `/agents → Settings → Remember agents`; with it off, handles expire with their record (roughly ten minutes past completion) and `@explore` then starts a fresh agent rather than resuming — the behaviour before this setting existed. With it on (the default), the eviction leaves a tombstone in `<agentDir>/subagent-tombstones.json` that survives restarts and session switches (see [Session archive](#session-archive)), so the resume keeps working long after the record is gone.
 
 **Output transcript** (`outputTranscript`, default `true`): the project/global default for writing each subagent's `.output` transcript. Toggle via `/agents → Settings → Output transcript`, or set `false` in `subagents.json` to make transcripts opt-in project-wide — useful when run transcripts shouldn't sit on disk for backup or DLP tooling to pick up. A custom agent's `output_transcript` frontmatter overrides this per agent. Applied live at spawn time. Governs only the transcript, not `persist_session`, worktree commits, or memory files.
 
@@ -718,6 +720,87 @@ EOF
 Every project now starts with concurrency 16 and grace 10, without ever touching the menu. Individual projects can still override via `/agents` → Settings.
 
 **Failure behavior:** missing file is silent; malformed JSON logs a `[pi-subagents] Ignoring malformed settings at …` warning to stderr; invalid/out-of-range field values are dropped per-field; write failures downgrade the `/agents` toast to a warning with `(session only; failed to persist)`.
+
+## Stream retry
+
+When a provider stream drops mid-turn (disconnect, reset, socket hang-up), the agent resumes the same session with a continuation prompt instead of failing outright. This is **on by default** and therefore changes behavior for every user — disable it explicitly if a project must fail fast.
+
+Configured in **pi's settings** (`~/.pi/agent/settings.json` and `.pi/settings.json`, project wins per field), not in `subagents.json`:
+
+```json
+{
+  "subagents-retry": {
+    "enabled": true,
+    "maxAttempts": 5,
+    "baseDelayMs": 1200
+  }
+}
+```
+
+| Setting | Default | Meaning |
+|---------|---------|---------|
+| `subagents-retry.enabled` | `true` | Master switch. `false` disables **both** stream and transient retries. |
+| `subagents-retry.maxAttempts` | `5` | Total attempts including the initial run (1–100) — applies to **stream** failures. |
+| `subagents-retry.baseDelayMs` | `1200` | Fixed delay before each stream resume attempt in ms (0–300000). Constant pause, no backoff. |
+| `subagents-retry.transientMaxAttempts` | `8` | Attempt budget for **transient** failures (1–100): connect refused/timeout, DNS, abort. |
+| `subagents-retry.transientBaseDelayMs` | `5000` | Base delay for transient retries in ms (0–300000). Backs off exponentially (`base × 2^(n-1)`). |
+| `subagents-retry.transientBackoffCapMs` | `60000` | Ceiling for the transient backoff in ms (0–600000). |
+| `subagents-retry.maxElapsedMs` | `180000` | Hard time budget for the whole retry loop in ms (0–3600000). `0` disables the check. |
+
+Failures are classified once, in this precedence order:
+
+1. **`usage-limit`** (429 / quota / rate limit) → never retried here; the model fallback chain owns those.
+2. **`stream`** → mid-stream disconnects (`stream disconnected`, `socket hang up`, `wsarecv`, …). Budget = `maxAttempts`, delay = `baseDelayMs` (fixed).
+3. **`transient`** → connect-level failures (`fetch failed`, `ECONNREFUSED`, `ETIMEDOUT`, `EAI_AGAIN`, `ENOTFOUND`, `time out`, `AbortError`, TLS handshake, …). Budget = `transientMaxAttempts`, delay = `transientBaseDelayMs` with exponential backoff capped at `transientBackoffCapMs`. This is the family that used to fall through to a hard failure — the one users felt as "retry never kicks in".
+4. **`none`** → anything else (auth failures, permanent certificate errors). Fails the run immediately.
+
+The classification reads the flattened `cause` chain, so a 429 buried in a `cause` object is still caught as `usage-limit`. `maxElapsedMs` bounds the whole loop regardless of remaining attempts, so a VPN cutover lasting minutes gives up after 3 minutes instead of hanging. Retried turns keep streaming into the run's `.output` transcript. Structured-output spawns (`agent({ schema })`) are excluded from retrying: a retry continues schema-less, which would leave `structuredJson` stale under a `completed` status. Invalid values are dropped per-field with a `[pi-subagents] Ignoring invalid subagents-retry.…` stderr warning; disabling is `enabled: false` only (a `maxAttempts` of `0` is rejected, not treated as "off").
+
+## Model fallback chain
+
+When the primary model hits a usage limit mid-run, the agent can continue the same session on a fallback model instead of failing. Write the chain as a comma-separated list in the `model` field — the `Agent` tool's `model` parameter, an agent file's `model:` frontmatter, a nested `Agent` call, or a workflow's `agent()` options all accept it:
+
+```
+model: "anthropic/claude-sonnet-4-6, openai/gpt-5.6-luna, google/gemini-2.5-pro"
+```
+
+The first entry is the primary; the rest are fallbacks, tried in order. The primary is resolved at spawn time, while fallbacks stay as raw strings and are resolved lazily at switch time (so a fallback that gains authentication later can still be used). A `resume` with a `model` override uses only the first entry — chains do not apply to resumes.
+
+It triggers **only on confirmed usage-limit errors** (HTTP 429, `rate limit`, `insufficient_quota` / `quota exceeded`, `usage limit`, `free allowance`, or a numeric `status`/`statusCode` of 429). Anything ambiguous — disconnects, `overloaded`, 5xx, auth failures — never triggers a fallback and keeps the conventional behavior (stream retry owns disconnects; anything else fails the run). An unresolvable candidate (unknown model, missing auth) or a failed switch is skipped to the next candidate; when every candidate is exhausted, the last error is returned as-is.
+
+> ⚠️ **Side effect: `setModel` rewrites your global default model.** Switching models calls pi's `AgentSession.setModel`, which also writes the new model into the user's global default (`settingsManager.setDefaultModelAndProvider` → `globalSettings` + `save()`) — so after a fallback fires, your *next* session may start on the fallback model, not the one you had configured. The same applies to a `resume` with a `model` override. This was confirmed by **code reading** of the bundled pi build (`node_modules/@earendil-works/pi-coding-agent/dist/core/agent-session.js` → `settings-manager.js`), **not** by a live persistence measurement — treat the exact on-disk behavior as "pi 側仕様のため要確認" if your setup differs.
+
+No comma means no fallback: a single model behaves exactly as before. When a switch does happen, the result text gains one memo line per switch at the end, so the handoff is visible without opening the transcript:
+
+```
+モデルを anthropic/claude-sonnet-4-6 → openai/gpt-5.6-luna に切り替えて継続しました（使用制限エラーのため）。
+```
+
+## Session archive
+
+Subagent sessions persist a pi session file per run (see [Persistent settings](#persistent-settings) → **Remember agents**), so a busy project accumulates hundreds of JSONL transcripts under `~/.pi/agent/sessions/<encoded-cwd>/`. Opt into automatic housekeeping and stale **subagent** transcripts — those whose session header carries a `parentSession` — move into an `archive/` subdirectory at session start. The main session's file has no parent and is never touched, and neither is anything already inside `archive/`.
+
+Configured in **pi's settings** (`~/.pi/agent/settings.json` and `.pi/settings.json`, project wins per field), not in `subagents.json`:
+
+```json
+{
+  "session-archive": {
+    "enabled": true,
+    "maxAgeHours": 24
+  }
+}
+```
+
+| Setting | Default | Meaning |
+|---------|---------|---------|
+| `session-archive.enabled` | `false` | Sweep on session start when on. |
+| `session-archive.maxAgeHours` | `24` | Idle age (file mtime) after which a subagent transcript is archivable; strictly older moves. |
+
+Both are also settable from `/agents → Settings` (**Session archive** on/off, **Archive age hours** numeric); the menu writes the project `.pi/settings.json`, leaving global alone.
+
+Details: a file whose first line does not parse as a session header is skipped, as is any non-`.jsonl` file. A name collision in `archive/` is never overwritten — the source stays in place and is skipped for that run. A settings file that cannot be read, or a missing session directory, silently disables the sweep; failures surface as a `Session archive failed` notify rather than an error. Nothing is notified when no session moved. Archived transcripts stay resumable: resume-by-id scans `archive/` directly, and a tombstoned agent whose file moved is reopened from its archive sibling.
+
+Evicted agents are never deleted before archiving — every finished top-level agent leaves a tombstone (handle/alias/id/type/session file/finished-at) in `<agentDir>/subagent-tombstones.json`, kept across session switches up to 1000 entries, so `@handle` and `resume:` keep working after the 10-minute memory GC. Disk growth is gradual: a tombstone is a few hundred bytes (1000 entries ≈ 100KB); transcripts are append-only JSONL under pi's own retention. Explicit deletion is `dropTombstone` (single) / manager `clearTombstones()` (all).
 
 ## Events
 
@@ -977,6 +1060,7 @@ src/
   prompts.ts          # Config-driven system prompt builder
   context.ts          # Parent conversation context for inherit_context
   settings.ts         # Persistent settings (~/.pi/agent/subagents.json + .pi/subagents.json)
+  session-archive.ts  # Auto-archive stale subagent session transcripts into archive/
   env.ts              # Environment detection (git, platform)
 
   workflow/

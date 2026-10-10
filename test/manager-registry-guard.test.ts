@@ -11,7 +11,10 @@
  * The fix: the first activation claims the slot, later activations leave it
  * alone, and only the owner's shutdown releases it.
  */
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../src/agent-runner.js", async () => {
   const actual = await vi.importActual<typeof import("../src/agent-runner.js")>("../src/agent-runner.js");
@@ -70,12 +73,25 @@ async function spawnBackground(tools: Map<string, any>): Promise<string> {
   return /Agent ID: (\S+)/.exec(textOf(r))![1];
 }
 
+// The extension mirrors tombstones to the agent dir on eviction: point it at
+// a fresh temp dir per test so the developer's real store (which always holds
+// entries on a lived-in machine) can't leak into handle allocation here.
+let hermeticAgentDir = "";
+let prevAgentDir: string | undefined;
+beforeEach(() => {
+  prevAgentDir = process.env.PI_CODING_AGENT_DIR;
+  hermeticAgentDir = mkdtempSync(join(tmpdir(), "pi-registry-agentdir-"));
+  process.env.PI_CODING_AGENT_DIR = hermeticAgentDir;
+});
 // Restore the global slot around every test.
 const priorGlobal = (globalThis as any)[MANAGER_KEY];
 afterEach(() => {
   if (priorGlobal === undefined) delete (globalThis as any)[MANAGER_KEY];
   else (globalThis as any)[MANAGER_KEY] = priorGlobal;
   vi.mocked(runAgent).mockReset();
+  if (prevAgentDir == null) delete process.env.PI_CODING_AGENT_DIR;
+  else process.env.PI_CODING_AGENT_DIR = prevAgentDir;
+  rmSync(hermeticAgentDir, { recursive: true, force: true });
 });
 
 describe("Symbol.for manager registry across activations", () => {

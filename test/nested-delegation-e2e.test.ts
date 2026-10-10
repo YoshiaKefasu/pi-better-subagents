@@ -20,6 +20,7 @@ import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, wr
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type Context, fauxToolCall } from "@earendil-works/pi-ai";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { registerAgents } from "../src/agent-types.js";
 import { loadCustomAgents } from "../src/custom-agents.js";
@@ -182,8 +183,10 @@ describe("nested delegation e2e (real pi-mono, faux model)", () => {
     const cwd = mkdtempSync(join(tmpdir(), "nested-e2e-bg-"));
     tmpDirs.push(cwd);
     writeAgents(cwd);
-    const transcriptRoot = join(tmpdir(), `pi-subagents-${process.getuid?.() ?? 0}`, encodeCwd(cwd));
-    rmSync(transcriptRoot, { recursive: true, force: true });
+    // No pre-run cleanup: the run's hermetic agent dir is fresh per run, and
+    // the root below it only exists once the run has written transcripts.
+    // Declared outside try: finally cleans it up even when the run throws.
+    let transcriptRoot: string | undefined;
 
     const respond = (context: Context): FauxReply => {
       const text = firstUserText(context);
@@ -244,7 +247,10 @@ describe("nested delegation e2e (real pi-mono, faux model)", () => {
       // this root. Identify the WORKER's own transcript by the prompt in its
       // initial entry — matching the marker alone would also match the
       // orchestrator's transcript, which merely echoes it, and would pass even
-      // with nested transcripts switched off entirely.
+      // with nested transcripts switched off entirely. The root is resolved
+      // here (not before the run): it lives under the run's hermetic agent
+      // dir, which only exists once the run has started.
+      transcriptRoot = join(getAgentDir(), "tmp", "subagents-output", encodeCwd(cwd));
       // Match on the FIRST line — writeInitialEntry seeds each transcript with the
       // prompt that agent was given. Searching the whole file would also match the
       // orchestrator's, which records the same string inside its Agent tool-call
@@ -258,7 +264,7 @@ describe("nested delegation e2e (real pi-mono, faux model)", () => {
       // ...and it streamed the child's own turn, not just the seeded prompt.
       expect(workerTranscript).toContain(WORKER_MARKER);
     } finally {
-      rmSync(transcriptRoot, { recursive: true, force: true });
+      if (transcriptRoot) rmSync(transcriptRoot, { recursive: true, force: true });
     }
   });
 });

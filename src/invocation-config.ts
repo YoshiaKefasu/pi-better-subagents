@@ -1,5 +1,10 @@
 import { Type } from "@sinclair/typebox";
-import type { AgentConfig, IsolationMode, JoinMode, ThinkingLevel } from "./types.js";
+import type { Model } from "@earendil-works/pi-ai";
+import type { AgentSession } from "@earendil-works/pi-coding-agent";
+import type { AgentConfig, AgentInvocation, IsolationMode, JoinMode, ThinkingLevel } from "./types.js";
+import { parseModelChain } from "./model-fallback-chain.js";
+import { describeModel, type ModelRegistry, resolveModel } from "./model-resolver.js";
+import { checkModelScope } from "./model-scope.js";
 
 /**
  * The model-facing `isolation` parameter, shared by the `Agent` tool and the
@@ -123,33 +128,107 @@ export function resolveAgentInvocationConfig(
   const requested = agentConfig?.isolation ?? params.isolation;
   const isolation = requested === "worktree" && opts?.worktreeAllowed !== false ? "worktree" : undefined;
 
-  const overriddenThinking = agentConfig?.thinking != null && params.thinking != null
-    && agentConfig.thinking !== params.thinking
-    ? params.thinking as ThinkingLevel
-    : undefined;
-  const overriddenModel = agentConfig?.model != null && params.model != null
-    && agentConfig.model !== params.model
-    ? params.model
-    : undefined;
+  // Caller parameters (params.model / params.thinking) outrank the agent file's
+  // frontmatter, allowing temporary model/thinking overrides at spawn time.
+  const modelInput = params.model ?? agentConfig?.model;
+  const modelFromParams = params.model != null;
+  const thinking = (params.thinking ?? agentConfig?.thinking) as ThinkingLevel | undefined;
 
   return {
-    modelInput: agentConfig?.model ?? params.model,
-    modelFromParams: agentConfig?.model == null && params.model != null,
-    thinking: (agentConfig?.thinking ?? params.thinking) as ThinkingLevel | undefined,
+    modelInput,
+    modelFromParams,
+    thinking,
     maxTurns: agentConfig?.maxTurns ?? params.max_turns,
     inheritContext: agentConfig?.inheritContext ?? params.inherit_context ?? false,
     runInBackground: agentConfig?.runInBackground ?? params.run_in_background ?? opts?.defaultRunInBackground ?? false,
     isolated: agentConfig?.isolated ?? params.isolated ?? false,
     isolation,
-    // Undefined rather than an empty object when nothing was overridden: callers
-    // spread this into the invocation snapshot, and an always-present key would
-    // put `requestedThinking: undefined` on every record.
-    overridden: overriddenThinking || overriddenModel
-      ? { thinking: overriddenThinking, model: overriddenModel }
-      : undefined,
+    overridden: undefined,
   };
 }
 
 export function resolveJoinMode(defaultJoinMode: JoinMode, runInBackground: boolean): JoinMode | undefined {
   return runInBackground ? defaultJoinMode : undefined;
+}
+
+/**
+ * resume 時に live session のモデルを有効値へ合わせる。優先順位は新規 spawn
+ * （agent-runner の resolveDefaultModel）と同じ: 明示指定 > frontmatter > 親モデル。
+ * thinking が無条件に再適用されるのと対称にするためのもので、これが無いと
+ * 前回実行時のモデルが残り続ける。
+ *
+ * 安全条件:
+ * - 解決結果が undefined なら setModel しない
+ * - 既に同じモデル（provider + id）ならスキップ
+ *   （無駄な model_change 追記とプロンプトキャッシュ破壊を避ける）
+ * - frontmatter 由来の失敗は握って続行（resume を失敗させない）。
+ *   明示指定の失敗だけエラー文字列で返し、呼び出し元が textResult 化する。
+ */
+export async function applyResumeModel(args: {
+  modelRegistry: ModelRegistry;
+  parentModel?: Model<any>;
+  cwd: string;
+  notifyWarning?: (msg: string) => void;
+  /** 呼び出し元の明示指定 (params.model)。無ければ frontmatterModel を使う。 */
+  modelInput?: string;
+  /** resume 対象レコードの型の frontmatter `model:`。 */
+  frontmatterModel?: string;
+  session?: AgentSession;
+  invocation?: AgentInvocation;
+  agentLabel: string;
+}): Promise<string | undefined> {
+  const fromParams = args.modelInput != null;
+  const input = args.modelInput ?? args.frontmatterModel;
+  let target: Model<any> | undefined;
+  if (input) {
+    // resume は既存セッションへの切替のため連鎖は使わず先頭のみ。
+    const resolved: Model<any> | string = resolveModel(
+      parseModelChain(input)[0] ?? input,
+      args.modelRegistry,
+    );
+    if (typeof resolved === "string") {
+      // 明示指定の解決失敗は従来通り呼び出し元へ返す。
+      // frontmatter 由来は spawn 経路と同様に親モデルのまま続行。
+      if (fromParams) return resolved;
+      target = args.parentModel;
+    } else {
+      target = resolved;
+    }
+  } else {
+    target = args.parentModel;
+  }
+  if (!target) return undefined;
+  const scopeVerdict = checkModelScope({
+    model: target,
+    cwd: args.cwd,
+    modelRegistry: args.modelRegistry,
+    callerSupplied: fromParams,
+    agentLabel: args.agentLabel,
+    modelInput: input,
+  });
+  if (scopeVerdict.kind === "error") {
+    // kind:"error" は callerSupplied(= fromParams) が true のときだけ返る
+    // （model-scope.ts）。!fromParams では到達不能のため分岐を持たない。
+    if (fromParams) return scopeVerdict.message;
+  }
+  if (scopeVerdict.kind === "warn") args.notifyWarning?.(scopeVerdict.message);
+  const session = args.session;
+  if (!session) return undefined;
+  try {
+    if (session.model?.provider === target.provider && session.model?.id === target.id) {
+      return undefined;
+    }
+    await session.setModel(target);
+    if (args.invocation) {
+      const { modelName, modelId } = describeModel(target);
+      args.invocation.modelName = modelName;
+      args.invocation.modelId = modelId;
+    }
+  } catch (err) {
+    if (fromParams) {
+      return `Failed to switch model on resume: ${err instanceof Error ? err.message : String(err)}`;
+    }
+    /* frontmatter への復帰失敗は握って続行 */
+  }
+  return undefined;
 }

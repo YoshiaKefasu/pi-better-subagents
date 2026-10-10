@@ -196,16 +196,21 @@ describe("AgentManager — tombstones outliving the GC", () => {
     });
   });
 
-  it("leaves nothing behind when the session was only ever in memory", async () => {
-    // Without a file there is no conversation to reopen, so promising a resume
-    // would be a lie — the mention has to fall through to starting a new agent.
+  it("still tombstones a record whose session was only ever in memory (name held, not resumable)", async () => {
+    // Without a file there is no conversation to reopen — but the tombstone is
+    // still kept so the finished agent is never silently discarded: the name
+    // stays held against shadowing and the entry stays visible (and on disk).
+    // Only the reopen is impossible, which the resume paths enforce by
+    // requiring a session file.
     manager = new AgentManager();
     await evictable("Explore", "ephemeral", undefined);
 
     await vi.advanceTimersByTimeAsync(TICK);
 
-    expect(manager.resolveMention("explore")).toBeUndefined();
-    expect(manager.listTombstones()).toHaveLength(0);
+    const resolved = manager.resolveMention("explore");
+    expect(resolved?.kind).toBe("tombstone");
+    expect(manager.listTombstones()).toHaveLength(1);
+    expect(manager.listTombstones()[0].sessionFile).toBeUndefined();
   });
 
   it("holds the evicted handle so a later agent of the same type can't shadow it", async () => {
@@ -237,18 +242,18 @@ describe("AgentManager — tombstones outliving the GC", () => {
 
   it("drops the oldest once the cap is reached, keeping the most recent", async () => {
     manager = new AgentManager();
-    for (let i = 0; i < 101; i++) {
+    for (let i = 0; i < 1001; i++) {
       const { record } = await evictable("Explore", `run-${i}`, `/sessions/${i}.jsonl`);
       // Distinct ages so "oldest" is well defined; run-0 is the oldest. Set on
       // the record we just made — under fake timers every startedAt is equal,
       // so listAgents() has no meaningful order to index into.
-      record.completedAt = Date.now() - (TEN_MINUTES + 101_000 - i * 1000);
+      record.completedAt = Date.now() - (TEN_MINUTES + 1001_000 - i * 1000);
     }
     await vi.advanceTimersByTimeAsync(TICK);
 
-    expect(manager.listTombstones()).toHaveLength(100);
+    expect(manager.listTombstones()).toHaveLength(1000);
     expect(manager.resolveMention("explore")).toBeUndefined(); // run-0's handle
-    expect(manager.resolveMention("explore-101")?.kind).toBe("tombstone");
+    expect(manager.resolveMention("explore-1001")?.kind).toBe("tombstone");
   });
 
   it("hands a reclaimed name straight back, numbering nothing", async () => {
@@ -307,9 +312,11 @@ describe("AgentManager — tombstones outliving the GC", () => {
     expect(manager.getRecord(id)!.handle).toBe("explore");
   });
 
-  it("forgets every name when the session ends", async () => {
-    // A handle from a conversation the user has left must not resolve, or
-    // `@explore` reaches an agent they have no memory of starting.
+  it("keeps tombstones when the session ends (resume survives the switch)", async () => {
+    // Session boundaries evict live records into tombstones but no longer wipe
+    // them: an evicted agent stays reopenable in the next session, so `@explore`
+    // still reaches the conversation its user remembers starting. Explicit
+    // deletion is dropTombstone (single) / clearTombstones (all).
     manager = new AgentManager();
     await evictable("Explore", "prior session", "/sessions/prior.jsonl");
     await vi.advanceTimersByTimeAsync(TICK);
@@ -317,7 +324,7 @@ describe("AgentManager — tombstones outliving the GC", () => {
 
     manager.clearCompleted(true);
 
-    expect(manager.listTombstones()).toHaveLength(0);
-    expect(manager.resolveMention("explore")).toBeUndefined();
+    expect(manager.listTombstones()).toHaveLength(1);
+    expect(manager.resolveMention("explore")?.kind).toBe("tombstone");
   });
 });
