@@ -194,6 +194,15 @@ export interface AgentRecord {
   /** Cleanup function for the output file stream subscription. */
   outputCleanup?: () => void;
   /**
+   * The project root pi config (settings.json included) was discovered from
+   * at spawn — `SpawnOptions.configCwd ?? ctx.cwd`. Carried on the record
+   * because the resume paths (`startResume` / `resume`) have no spawn context
+   * of their own: the stream-retry gate must read the SAME retry settings the
+   * spawn path read, and without it a resumed run would silently fall back to
+   * `process.cwd()` and lose the project's `subagents-retry` section.
+   */
+  configCwd?: string;
+  /**
    * Lifetime usage breakdown, accumulated via `message_end` events. Survives
    * compaction. Total = input + output + cacheWrite (cacheRead deliberately
    * excluded — see issue #38). Initialized to zeros at spawn.

@@ -304,6 +304,35 @@ const CHILD_SHUTDOWN_TIMEOUT_MS = 3_000;
 /** resolveRecord の id prefix 解決に必要な最低文字数。disk 側 (findSessionOnDisk・ID prefix) と同値。 */
 const MIN_ID_PREFIX_LEN = 6;
 
+/**
+ * 進捗によるリトライ予算リセットの上限回数。実機 Pi では失敗した resumeAgent も
+ * 再送プロンプトとエラー応答を messages に push するため、進捗判定は successTurns
+ * ベース（下記 countSuccessfulAssistantTurns）にしているが、それでも「1ターン
+ * だけ進んでは永遠に切断を繰り返す」経路で予算が開き続けるのを防ぐ安全弁。
+ * ユーザー想定の VPN 回転等の単発切断（数回）は十分に収まる。
+ */
+const MAX_PROGRESS_RESETS = 10;
+
+/**
+ * セッション内の「成功した assistant ターン数」。stopReason が "error" /
+ * "aborted" の assistant メッセージは除外する — 失敗した resumeAgent 呼び出し
+ * 自体がエラー応答（role: "assistant", stopReason: "error"）を messages に
+ * push するため、素の messages.length は連続失敗でも増え、進捗判定に使うと
+ * 予算が毎回リセットされて無限ループする。
+ */
+function countSuccessfulAssistantTurns(messages: readonly unknown[] | undefined): number {
+  if (messages === undefined) return 0;
+  let count = 0;
+  for (const message of messages) {
+    if (message === null || typeof message !== "object") continue;
+    const m = message as { role?: unknown; stopReason?: unknown };
+    if (m.role !== "assistant") continue;
+    if (m.stopReason === "error" || m.stopReason === "aborted") continue;
+    count++;
+  }
+  return count;
+}
+
 const RETRYABLE_STREAM_ERRORS = [
   "stream disconnected",
   "stream ended",
@@ -744,6 +773,9 @@ export class AgentManager {
       workflowId: options.workflowId,
       maxSubagentDepth: options.maxSubagentDepth,
       rootSessionId: options.rootSessionId,
+      // retryStreamFailure と同じ解決点。resume 経路（spawn コンテキスト無し）が
+      // この値を頼りに同じ subagents-retry 設定を読む。
+      configCwd: options.configCwd ?? ctx.cwd,
     };
     this.agents.set(id, record);
     // After the insert, so `takenHandles()` already counts this record's own
@@ -1189,11 +1221,15 @@ export class AgentManager {
       return { succeeded: false, failure: retryFailureText(initialFailure) };
     }
     const maxAttempts = family === "transient" ? settings.transientMaxAttempts : settings.maxAttempts;
-    const startedAt = Date.now();
+    // 進捗リセットで更新し得るため let（下記 resetOnProgress を参照）。
+    let startedAt = Date.now();
     const elapsedExceeded = (): boolean =>
       settings.maxElapsedMs > 0 && Date.now() - startedAt >= settings.maxElapsedMs;
 
     let lastFailure = retryFailureText(initialFailure);
+    // 進捗リセットの累計回数。MAX_PROGRESS_RESETS で頭打ちにして、
+    // 「1ターンだけ進んでは切断を永遠に繰り返す」経路でも確実に終わらせる。
+    let progressResets = 0;
     console.warn(
       `[pi-subagents] Retrying ${family} failure (attempt 1/${maxAttempts}): ${retryFailureHeadline(lastFailure)}`,
     );
@@ -1212,6 +1248,32 @@ export class AgentManager {
         return { succeeded: false, failure: lastFailure };
       }
       if (elapsedExceeded()) break;
+
+      // この再送に入る前にどこまで会話が「実質的に」進んでいたか。resumeAgent が
+      // また切れて戻ってきた時点で成功ターン数か toolUses が増えていれば、その
+      // 切断は「単発」であって連続故障ではない — 長時間動くサブエージェントが
+      // VPN 回転等で10分おきに切れても、その間に作業が進んでいる限り通算予算
+      // で打ち切らない。
+      // Note: 素の messages.length は使わない。失敗した resumeAgent 呼び出し
+      // 自体がエラー応答（stopReason: "error"）を push するため、1ミリも
+      // 前進していない連続失敗でも増えてしまい、無限ループになる。成功
+      // assistant ターンのみを数える（countSuccessfulAssistantTurns）。
+      const prevSuccessTurns = countSuccessfulAssistantTurns(session.messages);
+      const prevToolUses = record.toolUses;
+      const resetOnProgress = () => {
+        if (progressResets >= MAX_PROGRESS_RESETS) return;
+        if (
+          countSuccessfulAssistantTurns(session.messages) <= prevSuccessTurns &&
+          record.toolUses <= prevToolUses
+        ) return;
+        console.warn(
+          `[pi-subagents] Conversation advanced before this ${family} failure; resetting the retry budget.`,
+        );
+        // attempt = 1 に戻せば次のループで attempt = 2 から再開する。
+        attempt = 1;
+        startedAt = Date.now();
+        progressResets++;
+      };
 
       try {
         // リトライ時は元プロンプトではなく、エラー内容を含んだ継続指示を送る。
@@ -1261,6 +1323,7 @@ export class AgentManager {
           return { succeeded: false, failure: lastFailure };
         }
         if (nextFamily !== "stream" && nextFamily !== "transient") break;
+        resetOnProgress();
       } catch (error) {
         lastFailure = retryFailureText(error);
         // throw されたエラーも同様：429 系・502 系ならリトライを打ち切る。
@@ -1271,6 +1334,8 @@ export class AgentManager {
           return { succeeded: false, failure: lastFailure };
         }
         if (caughtFamily !== "stream" && caughtFamily !== "transient") break;
+        // catch 側も同じ判定：進捗があれば予算をリセットする。
+        resetOnProgress();
       }
     }
 
@@ -1540,6 +1605,17 @@ export class AgentManager {
     record.result = undefined;
     record.error = undefined;
 
+    // startResume と同じ: spawn と同じゲート（shouldRetry に一本化）で切断を
+    // 自動再送する。設定は spawn 時と同じ configCwd から読む。structuredOutput
+    // は resume に無いため {} 相当。
+    const retrySettings = loadSubagentsRetrySettings(record.configCwd);
+    const retryOptions: SpawnOptions = {
+      description: record.description,
+      onToolActivity: options?.onToolActivity,
+      onAssistantUsage: options?.onAssistantUsage,
+      onCompaction: options?.onCompaction,
+    };
+
     try {
       const { text, failure } = await resumeAgent(record.session, prompt, {
         onToolActivity: (activity) => {
@@ -1558,15 +1634,43 @@ export class AgentManager {
         },
         signal,
       });
+      let finalText = text;
+      let finalFailure = failure;
+      // spawn の .then と同じゲート。429 系はリトライ対象外。
+      if (shouldRetry(failure, retrySettings, record, {})) {
+        const retryResult = await this.retryStreamFailure(record, retrySettings, signal, failure, retryOptions);
+        if (retryResult.succeeded) {
+          finalText = retryResult.text;
+          finalFailure = undefined;
+        } else {
+          finalFailure = retryResult.failure;
+        }
+      }
       // Same contract as the spawn path (#144): a failed final turn is an
       // error, not a completion — but the resumed text stays available.
-      record.status = failure ? "error" : "completed";
-      if (failure) record.error = failure;
-      record.result = text;
+      record.status = finalFailure ? "error" : "completed";
+      if (finalFailure) record.error = finalFailure;
+      record.result = finalText;
       record.completedAt = Date.now();
     } catch (err) {
+      let finalErr: unknown = err;
+      // spawn の .catch と同じゲート（shouldRetry に一本化）。429 系は対象外。
+      if (shouldRetry(err, retrySettings, record, {})) {
+        const retryResult = await this.retryStreamFailure(record, retrySettings, signal, err, retryOptions);
+        if (retryResult.succeeded) {
+          // spawn の .catch と同じ成功 tail: そのまま完了として定着させ、
+          // 下の共通 tail（abortOwnedChildren + return）を先に通して抜ける。
+          record.status = "completed";
+          record.error = undefined;
+          record.result = retryResult.text;
+          record.completedAt = Date.now();
+          this.abortOwnedChildren(id);
+          return record;
+        }
+        finalErr = new Error(retryResult.failure);
+      }
       record.status = "error";
-      record.error = err instanceof Error ? err.message : String(err);
+      record.error = finalErr instanceof Error ? finalErr.message : String(finalErr);
       record.completedAt = Date.now();
     }
 
@@ -1632,6 +1736,20 @@ export class AgentManager {
       this.drainQueue();
     };
 
+    // spawn と同じゲート（shouldRetry に一本化）: resume 経路でもストリーム切断を
+    // 自動再送する。設定は spawn 時と同じ configCwd から読む（this.cwd は存在
+    // しないため record.configCwd を使う）。structuredOutput は resume に無い
+    // ため {} 相当。
+    const retrySettings = loadSubagentsRetrySettings(record.configCwd);
+    // retryStreamFailure は SpawnOptions のコールバックだけを読む。resume 側の
+    // 同じコールバックを渡しておく（{} だと再送ターンの進捗が UI に届かない）。
+    const retryOptions: SpawnOptions = {
+      description: record.description,
+      onToolActivity: options.onToolActivity,
+      onAssistantUsage: options.onAssistantUsage,
+      onCompaction: options.onCompaction,
+    };
+
     const promise = resumeAgent(record.session, prompt, {
       onToolActivity: (activity) => {
         if (activity.type === "end") record.toolUses++;
@@ -1649,23 +1767,50 @@ export class AgentManager {
       },
       signal: abortController.signal,
     })
-      .then(({ text, failure }) => {
+      .then(async ({ text, failure }) => {
+        let finalText = text;
+        let finalFailure = failure;
+        // spawn の .then と同じゲート。429 系はリトライ対象外。
+        if (shouldRetry(failure, retrySettings, record, {})) {
+          const retryResult = await this.retryStreamFailure(record, retrySettings, parentSignal, failure, retryOptions);
+          if (retryResult.succeeded) {
+            finalText = retryResult.text;
+            finalFailure = undefined;
+          } else {
+            finalFailure = retryResult.failure;
+          }
+        }
         // Don't overwrite status if externally stopped via abort().
         if (record.status !== "stopped") {
           // Same contract as the spawn path (#144): a failed final turn is an
           // error, not a completion — but the resumed text stays available.
-          record.status = failure ? "error" : "completed";
-          if (failure) record.error = failure;
+          record.status = finalFailure ? "error" : "completed";
+          if (finalFailure) record.error = finalFailure;
         }
-        record.result = text;
+        record.result = finalText;
         record.completedAt ??= Date.now();
         settle();
-        return text;
+        return finalText;
       })
-      .catch((err) => {
+      .catch(async (err) => {
+        let finalErr: unknown = err;
+        // .then 側と同じゲート（shouldRetry に一本化）。429 系はリトライ対象外。
+        if (shouldRetry(err, retrySettings, record, {})) {
+          const retryResult = await this.retryStreamFailure(record, retrySettings, parentSignal, err, retryOptions);
+          if (retryResult.succeeded) {
+            // spawn の .catch と同じ成功 tail: そのまま完了として定着させる。
+            record.status = "completed";
+            record.error = undefined;
+            record.result = retryResult.text;
+            record.completedAt ??= Date.now();
+            settle();
+            return record.result ?? "";
+          }
+          finalErr = new Error(retryResult.failure);
+        }
         if (record.status !== "stopped") {
           record.status = "error";
-          record.error = err instanceof Error ? err.message : String(err);
+          record.error = finalErr instanceof Error ? finalErr.message : String(finalErr);
         }
         record.completedAt ??= Date.now();
         settle();
