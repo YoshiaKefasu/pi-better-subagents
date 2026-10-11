@@ -114,7 +114,6 @@ session_dir: .seams/pi-sessions/seam-plan-reviewer
 allowed_subagents: scout, reviewer
 prompt_mode: replace
 inherit_context: true
-run_in_background: true
 isolated: true
 ---
 
@@ -136,7 +135,6 @@ You are a security auditor.`);
     expect(agent.allowedSubagents).toEqual(["scout", "reviewer"]);
     expect(agent.promptMode).toBe("replace");
     expect(agent.inheritContext).toBe(true);
-    expect(agent.runInBackground).toBe(true);
     expect(agent.isolated).toBe(true);
     expect(agent.systemPrompt).toBe("You are a security auditor.");
   });
@@ -166,7 +164,6 @@ Just a prompt.`);
     expect(agent.allowedSubagents).toBeUndefined();
     expect(agent.promptMode).toBe("replace");
     expect(agent.inheritContext).toBeUndefined();
-    expect(agent.runInBackground).toBeUndefined();
     expect(agent.isolated).toBeUndefined();
     expect(agent.systemPrompt).toBe("Just a prompt.");
   });
@@ -1058,13 +1055,14 @@ Good body.`);
   // together — so a field can serialize to something the loader reads back
   // differently, and the agent silently changes shape on eject.
   describe("eject round-trip", () => {
+    const roundTripBase = {
+      description: "Round trip agent",
+      systemPrompt: "Body prompt.",
+      promptMode: "append",
+    } as AgentConfig;
+
     function roundTrip(cfg: Partial<AgentConfig>) {
-      const full: AgentConfig = {
-        description: "Round trip agent",
-        systemPrompt: "Body prompt.",
-        promptMode: "append",
-        ...cfg,
-      } as AgentConfig;
+      const full: AgentConfig = { ...roundTripBase, ...cfg } as AgentConfig;
       writeAgent("rt", serializeAgentFile(full));
       const loaded = loadCustomAgents(tmpDir).get("rt");
       expect(loaded).toBeDefined();
@@ -1096,7 +1094,6 @@ Good body.`);
         excludeExtensions: ["ext-beta"],
         disallowedTools: ["write"],
         inheritContext: true,
-        runInBackground: true,
         outputTranscript: false,
         isolated: true,
         memory: "project",
@@ -1110,25 +1107,25 @@ Good body.`);
       expect(loaded.excludeExtensions).toEqual(["ext-beta"]);
       expect(loaded.disallowedTools).toEqual(["write"]);
       expect(loaded.inheritContext).toBe(true);
-      expect(loaded.runInBackground).toBe(true);
       expect(loaded.outputTranscript).toBe(false);
       expect(loaded.isolated).toBe(true);
       expect(loaded.memory).toBe("project");
       expect(loaded.isolation).toBe("worktree");
     });
 
-    // The writer used to emit `run_in_background` only when truthy, so an
-    // explicit `false` was dropped. Harmless while foreground was the default
-    // and omission meant the same thing — but with `backgroundByDefault` on,
-    // dropping it flips the ejected agent to background.
-    it("preserves an explicit run_in_background: false instead of dropping it", () => {
-      expect(roundTrip({ runInBackground: false }).runInBackground).toBe(false);
-    });
-
-    it("leaves run_in_background unset when the config doesn't pin it", () => {
-      // Absent must stay absent — writing a value would freeze the agent
-      // against the setting rather than letting it follow the default.
-      expect(roundTrip({}).runInBackground).toBeUndefined();
+    // The retired key: neither written on eject nor read on load, so an agent
+    // file that still carries it is loaded exactly as if it were absent.
+    it("does not write or read run_in_background any more", () => {
+      const written = serializeAgentFile({ ...roundTripBase, runInBackground: false } as unknown as AgentConfig);
+      expect(written).not.toContain("run_in_background");
+      writeAgent("rt-stale", written);
+      // A file that still carries the key loads as if it were absent.
+      writeAgent(
+        "rt-legacy",
+        "---\ndescription: Legacy\nrun_in_background: false\n---\n\nBody.\n",
+      );
+      const loaded = loadCustomAgents(tmpDir);
+      expect((loaded.get("rt-legacy") as unknown as { runInBackground?: boolean }).runInBackground).toBeUndefined();
     });
 
     it("preserves the extension and skill list fields", () => {

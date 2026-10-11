@@ -1,19 +1,17 @@
 /**
- * background-by-default.test.ts — the `backgroundByDefault` flip, asserted at
- * the tool boundary rather than at the resolver.
+ * background-only.test.ts — background execution asserted at the tool boundary
+ * rather than at the resolver.
  *
- * `documented-defaults.test.ts` pins `resolveAgentInvocationConfig`'s arguments;
- * this pins what the orchestrator actually receives back from a real `Agent`
- * call, which is the part the tool description makes promises about:
+ * Every top-level spawn is detached: there is no foreground path left, so this
+ * pins what the orchestrator actually receives back from a real `Agent` call,
+ * which is the part the tool description makes promises about:
  *
- *   - an unqualified spawn hands back an ID instead of the agent's output,
- *   - `run_in_background: false` still blocks and returns the output inline,
+ *   - a spawn hands back an ID instead of the agent's output,
+ *   - a stale `run_in_background: false` from an old habit is ignored rather
+ *     than erroring, and still hands back an ID,
  *   - a fan-out sized like the ones the description tells the model to send
- *     runs concurrently instead of queueing behind `maxConcurrent`.
- *
- * That last one is the reason the concurrency default moved 4 → 10: foreground
- * agents bypass the pool, so the limit only started applying to ordinary
- * parallel work once background became the default.
+ *     runs concurrently instead of queueing behind `maxConcurrent` — the
+ *     reason the concurrency default moved 4 → 10.
  */
 import { describe, expect, it, vi } from "vitest";
 
@@ -77,7 +75,7 @@ function spawn(tools: Map<string, any>, params: Record<string, unknown> = {}) {
   );
 }
 
-describe("backgroundByDefault", () => {
+describe("background execution (no foreground path)", () => {
   it("returns an agent ID, not the result, when the call doesn't specify", async () => {
     const { pi, tools } = makePi();
     subagentsExtension(pi);
@@ -91,15 +89,19 @@ describe("backgroundByDefault", () => {
     expect(out).not.toContain("THE-PAYLOAD");
   });
 
-  it("still blocks and returns the output inline when run_in_background is false", async () => {
+  // The parameter is gone from the schema, but a cached transcript or a model
+  // repeating an old habit can still send it. It must be inert — never an
+  // "unknown parameter" error, and never a second spawn path to fall into.
+  it("ignores a stale run_in_background: false instead of blocking or erroring", async () => {
     const { pi, tools } = makePi();
     subagentsExtension(pi);
     settled("THE-PAYLOAD");
 
     const out = textOf(await spawn(tools, { run_in_background: false }));
 
-    expect(out).toContain("THE-PAYLOAD");
-    expect(out).not.toContain("started in background");
+    expect(out).toContain("Agent ID:");
+    expect(out).toContain("started in background");
+    expect(out).not.toContain("THE-PAYLOAD");
   });
 
   it("starts a six-way fan-out concurrently instead of queueing the tail", async () => {

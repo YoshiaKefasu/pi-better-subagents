@@ -11,28 +11,6 @@ import type { AgentMentionMode, JoinMode, ResultDisplayMode, ViewerMarkdownMode,
 export interface SubagentsSettings {
   maxConcurrent?: number;
   /**
-   * Max concurrent FOREGROUND (blocking) agents — `0` = unlimited, the default,
-   * which preserves the behaviour that has always applied: nothing bounded
-   * foreground work, and pi dispatches a message's tool calls through
-   * `Promise.all`, so an unqualified fan-out of blocking `Agent` calls runs all
-   * at once. Set it to bound that (#253 — on local models, parallel agents
-   * thrash the prompt cache).
-   *
-   * Deliberately independent of `maxConcurrent` rather than folded into it: a
-   * foreground agent blocks the parent anyway, so charging it to the background
-   * pool would let a saturated pool starve the main session of work it could
-   * have done itself.
-   *
-   * Bounds only spawns a caller is blocking on inline. Nested children are
-   * exempt — their parent is blocked awaiting them, so queueing a child behind
-   * its own parent would deadlock — and so are detached spawns from
-   * cross-extension RPC or `@handle` mentions, which block nobody and are
-   * documented to start immediately. Foreground `resume` is also outside the
-   * pool: it reuses an existing session and never reaches the spawn path, so
-   * several blocking resumes in one message can still exceed the limit.
-   */
-  maxConcurrentForeground?: number;
-  /**
    * 0 = unlimited — the extension's single source of truth for that convention:
    * `normalizeMaxTurns()` in agent-runner.ts treats 0 → `undefined`, and the
    * `/agents` → Settings input prompt explicitly says "0 = unlimited".
@@ -40,23 +18,6 @@ export interface SubagentsSettings {
   defaultMaxTurns?: number;
   graceTurns?: number;
   defaultJoinMode?: JoinMode;
-  /**
-   * Whether a top-level `Agent` spawn that doesn't say runs detached.
-   * Defaults to `true`, following Claude Code, where the agent backgrounds
-   * unless the caller passes `run_in_background: false`. Set `false` to restore
-   * the previous behaviour, where an unqualified spawn blocked the turn and
-   * returned its result inline.
-   *
-   * Top-level only. Nested spawns (a subagent spawning its own) always default
-   * to foreground regardless of this setting — see `nested-tools.ts`, where a
-   * detached child would be killed by `abortOwnedChildren` when its parent
-   * settles, with no notification path to deliver its result.
-   *
-   * An explicit `run_in_background` on the call, or in the agent file's
-   * frontmatter, overrides this in both directions; the setting only decides
-   * what "unspecified" means.
-   */
-  backgroundByDefault?: boolean;
   /**
    * Master switch for the schedule subagent feature. Defaults to `true`.
    * When `false`: the `Agent` tool's `schedule` param + its guideline are
@@ -154,10 +115,11 @@ export interface SubagentsSettings {
   rememberAgents?: boolean;
   /**
    * Display mode for the persistent above-editor agent widget:
-   *   - `all`: show every agent (foreground + background).
-   *   - `background`: hide foreground agents — they already render inline as the
-   *     Agent tool result, so the widget would otherwise double-render them
-   *     (#118); everything else (background, queued, scheduled, RPC) stays.
+   *   - `all`: show every agent.
+   *   - `background`: hide agents a caller is awaiting inline — they already
+   *     render as that caller's own tool result, so the widget would otherwise
+   *     double-render them (#118); everything else (background, queued,
+   *     scheduled, RPC) stays.
    *   - `off`: hide the widget entirely.
    * Defaults to `background`. Pure-UI and applied live (toggling refreshes the
    * widget).
@@ -266,7 +228,7 @@ export interface SubagentsSettings {
   reportUsage?: boolean;
   /**
    * Whether the subagent surfaces show an estimated dollar cost next to their
-   * token counts (widget, FleetView, conversation viewer, foreground results,
+   * token counts (widget, FleetView, conversation viewer, inline results,
    * completion notifications). Defaults to `false`. Applied live.
    *
    * Rendered as `~$0.0042` — the tilde marks it as pi's reported estimate
@@ -311,11 +273,9 @@ export type ToolDescriptionMode = "full" | "compact" | "custom";
 /** Setter hooks used by applySettings to wire persisted values into in-memory state. */
 export interface SettingsAppliers {
   setMaxConcurrent: (n: number) => void;
-  setMaxConcurrentForeground: (n: number) => void;
   setDefaultMaxTurns: (n: number) => void;
   setGraceTurns: (n: number) => void;
   setDefaultJoinMode: (mode: JoinMode) => void;
-  setBackgroundByDefault: (b: boolean) => void;
   setSchedulingEnabled: (b: boolean) => void;
   setScopeModels: (enabled: boolean) => void;
   setStrictAgentFiles: (b: boolean) => void;
@@ -367,15 +327,6 @@ function sanitize(raw: unknown): SubagentsSettings {
   ) {
     out.maxConcurrent = r.maxConcurrent as number;
   }
-  // Floor 0, not 1 like maxConcurrent above: 0 is the documented "unlimited"
-  // value and the default, so dropping it would silently be unrepresentable.
-  if (
-    Number.isInteger(r.maxConcurrentForeground) &&
-    (r.maxConcurrentForeground as number) >= 0 &&
-    (r.maxConcurrentForeground as number) <= MAX_CONCURRENT_CEILING
-  ) {
-    out.maxConcurrentForeground = r.maxConcurrentForeground as number;
-  }
   if (
     Number.isInteger(r.defaultMaxTurns) &&
     (r.defaultMaxTurns as number) >= 0 &&
@@ -399,9 +350,6 @@ function sanitize(raw: unknown): SubagentsSettings {
   }
   if (typeof r.defaultJoinMode === "string" && VALID_JOIN_MODES.has(r.defaultJoinMode)) {
     out.defaultJoinMode = r.defaultJoinMode as JoinMode;
-  }
-  if (typeof r.backgroundByDefault === "boolean") {
-    out.backgroundByDefault = r.backgroundByDefault;
   }
   if (typeof r.schedulingEnabled === "boolean") {
     out.schedulingEnabled = r.schedulingEnabled;
@@ -519,15 +467,11 @@ export function saveSettings(s: SubagentsSettings, cwd: string = process.cwd()):
 /** Apply persisted settings to the in-memory state via caller-supplied setters. */
 export function applySettings(s: SubagentsSettings, appliers: SettingsAppliers): void {
   if (typeof s.maxConcurrent === "number") appliers.setMaxConcurrent(s.maxConcurrent);
-  if (typeof s.maxConcurrentForeground === "number") {
-    appliers.setMaxConcurrentForeground(s.maxConcurrentForeground);
-  }
   if (typeof s.defaultMaxTurns === "number") appliers.setDefaultMaxTurns(s.defaultMaxTurns);
   if (typeof s.graceTurns === "number") appliers.setGraceTurns(s.graceTurns);
   if (typeof s.maxSubagentDepth === "number") appliers.setMaxSubagentDepth(s.maxSubagentDepth);
   if (typeof s.fallbackSubagent === "string") appliers.setFallbackSubagent(s.fallbackSubagent);
   if (s.defaultJoinMode) appliers.setDefaultJoinMode(s.defaultJoinMode);
-  if (typeof s.backgroundByDefault === "boolean") appliers.setBackgroundByDefault(s.backgroundByDefault);
   if (typeof s.schedulingEnabled === "boolean") appliers.setSchedulingEnabled(s.schedulingEnabled);
   if (typeof s.scopeModels === "boolean") appliers.setScopeModels(s.scopeModels);
   if (typeof s.strictAgentFiles === "boolean") appliers.setStrictAgentFiles(s.strictAgentFiles);

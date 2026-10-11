@@ -127,7 +127,7 @@ describe("toolDescriptionMode", () => {
     // One keyword per behavioral contract the orchestrator must know about.
     // If you change one of these behaviors, update BOTH descriptions.
     for (const contract of [
-      "run_in_background",
+      "background",
       "resume",
       "steer_subagent",
       'isolation: "worktree"',
@@ -150,7 +150,7 @@ describe("toolDescriptionMode", () => {
     const tool = setup().get("Agent");
     const visible = `${tool.description}\n${JSON.stringify(tool.parameters)}`;
     for (const contract of [
-      "run_in_background",
+      "background",
       "resume",
       "steer_subagent",
       "worktree",
@@ -166,7 +166,7 @@ describe("toolDescriptionMode", () => {
 
   it("every strategy param carries a real description of its own", () => {
     const props = setup().get("Agent").parameters?.properties ?? {};
-    for (const name of ["run_in_background", "model", "thinking", "inherit_context"]) {
+    for (const name of ["model", "thinking", "inherit_context"]) {
       // Long enough to be an explanation the model can act on, not a bare label.
       expect(props[name]?.description?.length ?? 0).toBeGreaterThan(40);
     }

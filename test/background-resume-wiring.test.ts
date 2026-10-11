@@ -1,9 +1,10 @@
 /**
- * Agent tool wiring for `resume` + `run_in_background` (#214).
+ * Agent tool wiring for `resume` (detached, #214).
  *
  * The manager-level mechanics live in agent-manager.test.ts; what this file
  * pins down is what the TOOL hands the manager, which is where a detached
- * resume can quietly diverge from a detached spawn.
+ * resume can quietly diverge from a detached spawn. Resume is always detached
+ * now — there is no foreground resume left to opt into.
  */
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -264,9 +265,9 @@ describe("Agent tool — background resume wiring", () => {
     await lifecycle.get("session_shutdown")?.({}, ctx);
   });
 
-  // Resume follows the same default as a fresh spawn — background — so
-  // foreground is now the explicit case rather than the implicit one.
-  it("still resumes in the foreground when run_in_background is false", async () => {
+  // A stale `run_in_background: false` is inert: resume stays detached either
+  // way, so an old habit cannot turn it back into a blocking call.
+  it("stays detached when a stale run_in_background: false is passed", async () => {
     const { pi, tools, lifecycle } = makePi();
     subagentsExtension(pi);
     const ctx = makeCtx(cwd);
@@ -281,9 +282,10 @@ describe("Agent tool — background resume wiring", () => {
       ctx,
     );
 
-    // Foreground resume returns the answer inline — no background handoff text.
-    expect(resultText(res)).toContain("inline answer");
-    expect(resultText(res)).not.toContain("You will be notified");
+    // Detached resume hands back an ID, not the answer.
+    expect(resultText(res)).toContain("Agent ID:");
+    expect(resultText(res)).toContain("You will be notified");
+    expect(resultText(res)).not.toContain("inline answer");
 
     await lifecycle.get("session_shutdown")?.({}, ctx);
   });

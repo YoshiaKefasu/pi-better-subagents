@@ -121,8 +121,9 @@ describe("reporting subagent usage back to the parent session", () => {
 
     expect(result.usage).toBeUndefined();
     // And the text result is untouched — the setting must not change what the
-    // orchestrator reads.
-    expect(result.content[0].text).toContain("Agent completed");
+    // orchestrator reads. The handoff text, now: a detached spawn no longer
+    // reports completion inline.
+    expect(result.content[0].text).toContain("started in background");
   });
 
   it("defaults to off", async () => {

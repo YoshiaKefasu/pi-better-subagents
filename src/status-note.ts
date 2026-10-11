@@ -33,8 +33,9 @@ export function getStatusNote(status: string): string {
 }
 
 /**
- * Foreground variant of `getStatusNote`. A foreground caller is in a different
- * position from a background one, so it needs different text:
+ * Inline variant of `getStatusNote`. A caller holding the agent's result in
+ * the same result is in a different position from a background one, so it needs
+ * different text:
  *
  *   - It already holds the agent's ENTIRE output inline, whereas the background
  *     notification carries a 500-char preview. So only here can we truthfully

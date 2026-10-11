@@ -51,21 +51,22 @@
  *   - it is called with no tool-call id. The clone's turn produces one, but the
  *     real session never issued it, and a `<tool-use-id>` pointing at nothing
  *     is exactly the bug the mention-resume path had to fix;
- *   - and it is forced into the background. A foreground agent returns its
- *     answer as the tool result and is marked `resultConsumed` so no completion
- *     notification is sent — correct when the caller is the real conversation,
- *     silent loss when the caller is a fork about to be discarded. Background
- *     delivery is the only route from a mention back to the main model.
+ *   - and it is always background. There is no foreground spawn any more, and
+ *     a foreground agent would have answered through its TOOL RESULT — which
+ *     is delivered into a session that is disposed moments later, so the agent
+ *     would run, appear in the widget and the fleet, and reach nobody. The tool
+ *     result is the only route from a mention back to the main model.
  *
  * The clone gets one tool and one job. It cannot read, write or run anything —
  * an invisible turn with the full toolset could do invisible work.
  */
 
-import type { Model } from "@earendil-works/pi-ai";
+import type { Model, SystemMessage } from "@earendil-works/pi-ai";
 import {
   buildSessionContext,
   createAgentSession,
   type ExtensionContext,
+  type ExtensionToolContext,
   SessionManager,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
@@ -115,17 +116,27 @@ export async function runMentionClone(opts: MentionCloneOptions): Promise<Mentio
         });
       }
       spawned = true;
-      // undefined tool-call id + the main ctx: see the header. Background is
-      // forced rather than left to the clone: `run_in_background` defaults to
-      // false, and a foreground agent answers through its TOOL RESULT — which
-      // here is delivered into a session that is disposed moments later, so the
-      // agent would run, appear in the widget and the fleet, and reach nobody.
+      // The registered tool is called verbatim: every spawn it makes is
+      // detached, and a detached one delivers its result through the completion
+      // notification — the only route that survives this fork being discarded.
+      //
+      // `execute` is typed against `ExtensionToolContext`: the session context
+      // plus `tools` and `executeTool()` for nested calls. Nothing here can
+      // build one — `createToolContext` lives on the extension runner, and the
+      // mention path reaches this from an event handler holding only an
+      // `ExtensionContext`. Nor does `Agent` read those two members: its handler
+      // takes `cwd`, `model`, `modelRegistry`, `sessionManager.getSessionId()`
+      // and `ui` off the context, every one of them on `ExtensionContext`. So
+      // the downcast below lands on the surface the spawn really depends on,
+      // and it keeps the spawn attributed to the MAIN session — `ctx` itself,
+      // not a widened copy, which is what files the output transcript and
+      // `rootSessionId` in the right place.
       return agentTool.execute(
         undefined as never,
-        { ...(params as Record<string, unknown>), run_in_background: true } as typeof params,
+        params,
         signal,
         onUpdate,
-        ctx,
+        ctx as ExtensionToolContext,
       );
     },
   };
@@ -174,8 +185,33 @@ export async function runMentionClone(opts: MentionCloneOptions): Promise<Mentio
     // but not the live one — extensions contribute to it per turn. Copy the
     // real thing, so the copy reasons under the instructions the user's model
     // is actually working under.
+    //
+    // There is no prompt to assign: `createMutableAgentState` exposes
+    // `state.systemPrompt` as a getter that replays the transcript's system
+    // messages through `getCurrentSystemPrompt`, and this module is strict, so
+    // writing it throws `TypeError: ... which has only a getter`. That throw
+    // lands in the catch below and every mention reports "the conversation
+    // clone did not start it". The documented route is a system message, and
+    // because a later message's `content` is JOINED onto the base rather than
+    // replacing it, "the live prompt" means leading with one system message
+    // that carries it and dropping the seeded ones — the same replace
+    // `AgentSession` performs for `forceSystemPrompt`. `toolsAdded` crosses over
+    // so the clone keeps declaring its one tool.
     const systemPrompt = ctx.getSystemPrompt?.();
-    if (systemPrompt) session.agent.state.systemPrompt = systemPrompt;
+    if (systemPrompt) {
+      const transcript = session.agent.state.messages;
+      const seeded = transcript[0];
+      const lead: SystemMessage | undefined = seeded?.role === "system" ? seeded : undefined;
+      session.agent.state.messages = [
+        {
+          role: "system",
+          content: systemPrompt,
+          ...(lead?.toolsAdded ? { toolsAdded: lead.toolsAdded } : {}),
+          timestamp: lead?.timestamp ?? Date.now(),
+        } satisfies SystemMessage,
+        ...transcript.filter((message) => message.role !== "system"),
+      ];
+    }
 
     // The conversation itself. Pushed rather than assigned so the array the
     // session was built around stays the one it goes on using.

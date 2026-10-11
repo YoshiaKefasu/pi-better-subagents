@@ -105,7 +105,7 @@ async function resumeByHandle(tools: Map<string, any>, handle: string, sessionCt
   finishedRun(fakeSession(), "resumed answer");
   return tools.get("Agent").execute(
     "tc-resume",
-    { prompt: "follow-up", description: "Follow-up", subagent_type: "general-purpose", resume: handle, run_in_background: false },
+    { prompt: "follow-up", description: "Follow-up", subagent_type: "general-purpose", resume: handle },
     undefined,
     undefined,
     sessionCtx,
@@ -137,7 +137,9 @@ describe("tombstone resume across session boundaries", () => {
     const result = await resumeByHandle(tools, handle, ctx());
     await flush();
 
-    expect(textOf(result)).toContain("resumed answer");
+    // Detached reopen: the id comes back now, the answer in the notification.
+    expect(textOf(result)).toContain("resumed from disk in background");
+    expect(textOf(result)).toContain("Agent ID:");
     expect(textOf(result)).not.toContain("Agent not found");
     const resumeOpts = vi.mocked(runAgent).mock.calls[0][3] as any;
     expect(resumeOpts.resumeSessionFile).toBe(sessionFile);
@@ -169,7 +171,9 @@ describe("tombstone resume across session boundaries", () => {
     const result = await resumeByHandle(tools, handle, sessionCtx);
     await flush();
 
-    expect(textOf(result)).toContain("resumed answer");
+    // Detached reopen: the id comes back now, the answer in the notification.
+    expect(textOf(result)).toContain("resumed from disk in background");
+    expect(textOf(result)).toContain("Agent ID:");
     expect(textOf(result)).not.toContain("Agent not found");
     // archive sibling が reopen 元として渡される。
     const resumeOpts = vi.mocked(runAgent).mock.calls[0][3] as any;

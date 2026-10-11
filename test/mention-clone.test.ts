@@ -92,6 +92,43 @@ function visibleTools(opts: any): any[] {
 }
 
 /**
+ * The clone's `AgentState`, as `createMutableAgentState` really builds it.
+ *
+ * `systemPrompt` is NOT a field: it is a getter over the transcript's system
+ * messages, with no setter, and the state is seeded with a leading system
+ * message holding the prompt rebuilt from cwd plus the tools handed to the
+ * model. A plain `systemPrompt` field would let `runMentionClone` assign to it
+ * and pass — while the real session throws `TypeError: ... which has only a
+ * getter` on exactly that line and every mention silently falls back to a
+ * direct start. Reproducing the shape is what makes that regression fail here.
+ */
+function cloneAgentState(rebuiltPrompt: string, tools: unknown[]) {
+  let messages: any[] = [
+    {
+      role: "system",
+      content: rebuiltPrompt,
+      ...(tools.length > 0 ? { toolsAdded: tools } : {}),
+      timestamp: 0,
+    },
+  ];
+  return {
+    get messages() {
+      return messages;
+    },
+    set messages(next: any[]) {
+      messages = next.slice();
+    },
+    get systemPrompt() {
+      // `getCurrentSystemPrompt`: later `content` is joined onto the base.
+      return messages
+        .filter((message) => message.role === "system")
+        .map((message) => (typeof message.content === "string" ? message.content : ""))
+        .join("\n\n");
+    },
+  };
+}
+
+/**
  * Stand in for `createAgentSession`. `turn` receives the clone's single custom
  * tool and plays the part of the model deciding what to do with it — and only
  * the tools Pi would really expose reach it, so a clone built with an allowlist
@@ -99,7 +136,7 @@ function visibleTools(opts: any): any[] {
  */
 function cloneSession(turn?: (tool: any) => Promise<void> | void) {
   const session = {
-    agent: { state: { systemPrompt: "rebuilt-from-cwd", messages: [] as any[] } },
+    agent: { state: cloneAgentState("rebuilt-from-cwd", [{ name: "Agent" }]) },
     prompt: vi.fn(async () => {}),
     dispose: vi.fn(),
   } as any;
@@ -132,12 +169,14 @@ const opts = (over: Record<string, unknown> = {}) => ({
 
 describe("cloning the conversation", () => {
   it("carries the conversation's own messages, not a rendering of them", async () => {
-    // The whole point: the copy reasons over what the main model can see.
+    // The whole point: the copy reasons over what the main model can see. The
+    // clone's own leading system message is not conversation content, so it is
+    // filtered out rather than asserted around.
     const session = cloneSession(callsAgent());
 
     await runMentionClone(opts());
 
-    expect(session.agent.state.messages).toEqual([
+    expect(session.agent.state.messages.filter((message: any) => message.role !== "system")).toEqual([
       { role: "user", content: [{ type: "text", text: "hi" }] },
       { role: "assistant", content: [{ type: "text", text: "hello" }] },
     ]);
@@ -192,7 +231,12 @@ describe("cloning the conversation", () => {
     const result = await runMentionClone(o);
 
     expect(result).toEqual({ spawned: true });
-    expect(session.agent.state.messages).toEqual([]);
+    // Nothing to carry, but the clone still runs on the live prompt — and the
+    // seeded prompt is replaced, not appended to, which is what `content`
+    // joining would otherwise produce.
+    expect(session.agent.state.messages).toEqual([
+      { role: "system", content: "the live system prompt", toolsAdded: [{ name: "Agent" }], timestamp: 0 },
+    ]);
     expect(session.agent.state.systemPrompt).toBe("the live system prompt");
   });
 
@@ -290,40 +334,28 @@ describe("attributing the spawn to the real session", () => {
 
     await runMentionClone(opts({ agentTool: tool }));
 
+    // Forwarded verbatim, including any stale `run_in_background` the clone's
+    // model emits: the registered tool ignores that key now, so rewriting it
+    // here would only be a second place to keep in step.
     expect(tool.execute.mock.calls[0][1]).toEqual({
       subagent_type: "Plan",
       prompt: "sketch the migration",
-      run_in_background: true,
     });
   });
 
-  it("forces the spawn into the background — a foreground result goes nowhere", async () => {
-    // `run_in_background` defaults to false, and a foreground agent returns its
-    // answer as the TOOL RESULT: AgentManager marks the record `resultConsumed`
-    // precisely so the completion notification is skipped as redundant. Here
-    // that tool result lands in the throwaway clone, which is disposed moments
-    // later — so the agent runs to completion, shows up in the widget and the
-    // fleet, and its answer reaches nobody. The main conversation is not part
-    // of the clone's turn, so background delivery is the only way back.
-    const tool = agentTool();
-    cloneSession(callsAgent({ subagent_type: "Explore", prompt: "go" }));
-
-    await runMentionClone(opts({ agentTool: tool }));
-
-    expect(tool.execute.mock.calls[0][1]).toMatchObject({ run_in_background: true });
-  });
-
-  it("overrides a clone that explicitly asked for a foreground run", async () => {
-    // Nothing tells the clone's model that its own turn is discarded, so an
-    // explicit `false` is a reasonable thing for it to emit. It must not decide
-    // this one.
+  it("never rewrites a stale run_in_background the clone asked for", async () => {
+    // Every spawn the registered tool makes is detached, so there is nothing to
+    // force and nothing to override - a leftover `false` rides along and is
+    // ignored by the resolver. What makes the mention safe is the tool's own
+    // behaviour, not a value this clone injects.
     const tool = agentTool();
     cloneSession(callsAgent({ subagent_type: "Explore", prompt: "go", run_in_background: false }));
 
     await runMentionClone(opts({ agentTool: tool }));
 
-    expect(tool.execute.mock.calls[0][1]).toMatchObject({ run_in_background: true });
+    expect(tool.execute.mock.calls[0][1]).toMatchObject({ run_in_background: false });
   });
+
 
   it("refuses a second spawn from the same mention", async () => {
     // One handle, one agent. A clone that decides to also launch something else

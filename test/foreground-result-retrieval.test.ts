@@ -1,25 +1,24 @@
 /**
- * foreground-result-retrieval.test.ts — issue #174, via the REAL Agent tool +
- * the REAL get_subagent_result tool.
+ * result-retrieval.test.ts — issue #174, via the REAL Agent tool + the REAL
+ * get_subagent_result tool.
  *
- * Report: a FOREGROUND agent that wraps up at max_turns returns its partial
- * result inline, but a get_subagent_result for "that agent ID" immediately
- * afterwards answers `Agent not found ... It may have been cleaned up.` — with
- * no /new, /resume or session switch in between.
+ * Report: an agent that wraps up at max_turns returns its partial result, but a
+ * get_subagent_result for "that agent ID" immediately afterwards answers
+ * `Agent not found ... It may have been cleaned up.` — with no /new, /resume or
+ * session switch in between.
  *
- * Tracing says the premise can't hold, and these tests pin both halves of why:
+ * The premise is gone with the foreground path — the reporter's agent used to
+ * return its result inline and its id lived only in renderer `details`, which is
+ * never serialized to the API. A detached spawn puts `Agent ID: ...` in the text
+ * the model actually receives, so the id it passes back is one we issued. What
+ * remains is the other half of the bug, and these tests pin it:
  *
- *   1. The record is NOT cleaned up. Foreground completion mutates the record
- *      in place (agent-manager.ts startAgent's .then) — nothing deletes it. So
- *      a lookup with the REAL id succeeds.
- *   2. The model never HAD the real id. Foreground returns the result text
- *      only; the id travels in `details`, which is renderer metadata and never
- *      reaches the API (only `content` is serialized). The background path is
- *      the one that puts `Agent ID: ...` in the text.
- *
- * Together: whatever id the reporter's model passed, it wasn't one we issued,
- * and "not found" was the correct answer. Test 3 pins the eviction rule that
- * DOES apply, so the two are not confused again.
+ *   1. The record is NOT cleaned up by completion. A lookup with the REAL id
+ *      succeeds, and carries the full payload.
+ *   2. An id we never issued is still correctly rejected — the reporter's error,
+ *      reproduced WITHOUT any record having been cleaned up.
+ *   3. The eviction rule that DOES apply: a session switch keeps an UNREAD
+ *      result (that is what `skipUnconsumed` buys) and drops a consumed one.
  */
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -39,9 +38,9 @@ function makePi() {
   const lifecycle = new Map<string, any>();
   const pi = {
     registerMessageRenderer: vi.fn(),
+    registerEntryRenderer: vi.fn(),
     registerTool: vi.fn((t: any) => tools.set(t.name, t)),
     registerCommand: vi.fn(),
-    registerEntryRenderer: vi.fn(),
     registerFlag: vi.fn(),
     getFlag: vi.fn(),
     on: vi.fn((event: string, handler: any) => lifecycle.set(event, handler)),
@@ -70,15 +69,15 @@ function ctx() {
 const textOf = (r: any): string => r.content[0].text;
 
 /**
- * Run a FOREGROUND agent that wraps up at the turn limit — the exact #174
- * shape. `steered: true` is what agent-manager turns into status "steered",
- * which is what produces the reporter's "(wrapped up at the turn limit —
- * output may be partial)" note.
+ * Run an agent that wraps up at the turn limit — the exact #174 shape.
+ * `steered: true` is what agent-manager turns into status "steered", which is
+ * what produces the reporter's "(wrapped up at the turn limit — output may be
+ * partial)" note.
  *
- * Returns the tool result plus the id read out of `details` — the only place
- * a foreground id exists, which is the point of test 2.
+ * Returns the receipt plus the id read out of its TEXT — the only place a
+ * detached id exists, which is the point of test 2.
  */
-async function runForegroundSteeredAgent(tools: Map<string, any>) {
+async function runSteeredAgent(tools: Map<string, any>) {
   vi.mocked(runAgent).mockResolvedValue({
     responseText: "THE-RESULT-PAYLOAD",
     session: { dispose: vi.fn() } as any,
@@ -86,24 +85,23 @@ async function runForegroundSteeredAgent(tools: Map<string, any>) {
     steered: true,
   });
   const res = await tools.get("Agent").execute(
-    "tc-fg",
+    "tc-spawn",
     {
       prompt: "Perform a very thorough read-only codebase exploration.",
       description: "Locate organization-scope changes",
       subagent_type: "Explore",
       max_turns: 20,
-      run_in_background: false,
     },
     undefined,
     undefined,
     ctx(),
   );
-  const id = (res as any).details?.agentId as string | undefined;
-  expect(id, "foreground spawn should have produced a record id in details").toBeTruthy();
+  const id = /Agent ID: (\S+)/.exec(textOf(res))?.[1];
+  expect(id, "detached spawn should have put an agent id in its receipt").toBeTruthy();
   return { res, id: id as string };
 }
 
-describe("issue #174: foreground agent that hits max_turns", () => {
+describe("issue #174: agent that hits max_turns", () => {
   let tmpDir: string;
   let agentDir: string;
   let prevCwd: string;
@@ -140,31 +138,29 @@ describe("issue #174: foreground agent that hits max_turns", () => {
   it("is NOT cleaned up — get_subagent_result with the real id still resolves it", async () => {
     const { pi, tools, lifecycle } = makePi();
     subagentsExtension(pi);
-    const { res, id } = await runForegroundSteeredAgent(tools);
-
-    // The inline result is the turn-limit wrap-up the reporter described.
-    expect(textOf(res)).toContain("wrapped up at the turn limit");
+    const { id } = await runSteeredAgent(tools);
 
     // No /new, no /resume, no session switch — exactly the reporter's sequence.
     const read = await tools.get("get_subagent_result").execute("tc-read", { agent_id: id }, undefined, undefined, ctx());
     const out = textOf(read);
     expect(out).not.toContain("Agent not found");
     expect(out).toContain("THE-RESULT-PAYLOAD");
+    // ...and it reads as the truncated run it was, not a completion.
+    expect(out).toContain("wrapped up at the turn limit");
 
     await lifecycle.get("session_shutdown")?.({}, ctx());
   });
 
-  it("never hands the model an agent id — the id lives only in renderer details", async () => {
+  it("hands the model the real id, and still rejects an invented one", async () => {
     const { pi, tools, lifecycle } = makePi();
     subagentsExtension(pi);
-    const { res, id } = await runForegroundSteeredAgent(tools);
+    const { res, id } = await runSteeredAgent(tools);
 
-    // `content` is the only thing serialized to the API. If the id isn't here,
-    // the model cannot have obtained it — any id it passes is invented.
-    expect(textOf(res)).not.toContain(id);
-    expect(textOf(res)).not.toMatch(/Agent ID:/);
+    // `content` is the only thing serialized to the API — and there the id is.
+    expect(textOf(res)).toContain(id);
+    expect(textOf(res)).toMatch(/Agent ID:/);
 
-    // An invented id is correctly rejected — this is the reporter's error,
+    // An id we never issued is correctly rejected: this is the reporter's error,
     // reproduced WITHOUT any record having been cleaned up.
     const bogus = await tools.get("get_subagent_result").execute(
       "tc-bogus",
@@ -188,7 +184,7 @@ describe("issue #174: foreground agent that hits max_turns", () => {
     const parent = makePi();
     subagentsExtension(parent.pi);
     await parent.lifecycle.get("session_start")?.({}, ctx());
-    const { id } = await runForegroundSteeredAgent(parent.tools);
+    const { id } = await runSteeredAgent(parent.tools);
 
     // A child activation runs its full lifecycle, as a subagent session does.
     const child = makePi();
@@ -205,17 +201,22 @@ describe("issue #174: foreground agent that hits max_turns", () => {
     await parent.lifecycle.get("session_shutdown")?.({}, ctx());
   });
 
-  it("IS evicted by a session switch — its result was already delivered inline", async () => {
+  it("is KEPT by a session switch while its result is unread, then evicted once consumed", async () => {
     const { pi, tools, lifecycle } = makePi();
     subagentsExtension(pi);
-    const { id } = await runForegroundSteeredAgent(tools);
+    const { id } = await runSteeredAgent(tools);
 
-    // Foreground results count as consumed the moment they're returned inline,
-    // so clearCompleted(true)'s #108 preservation deliberately does not cover
-    // them. This is the ONLY path that makes a foreground id stop resolving.
+    // An unread result is exactly what `skipUnconsumed` preserves: the switch
+    // happens before the orchestrator has had a chance to fetch it.
     await lifecycle.get("session_before_switch")?.();
+    let read = await tools.get("get_subagent_result").execute("tc-read", { agent_id: id }, undefined, undefined, ctx());
+    expect(textOf(read)).not.toContain("Agent not found");
+    expect(textOf(read)).toContain("THE-RESULT-PAYLOAD");
 
-    const read = await tools.get("get_subagent_result").execute("tc-read", { agent_id: id }, undefined, undefined, ctx());
+    // Once it HAS been read, the next boundary may drop it — the manager never
+    // keeps a consumed record alive for a session that is leaving anyway.
+    await lifecycle.get("session_before_switch")?.();
+    read = await tools.get("get_subagent_result").execute("tc-read-2", { agent_id: id }, undefined, undefined, ctx());
     expect(textOf(read)).toContain("Agent not found");
 
     await lifecycle.get("session_shutdown")?.({}, ctx());

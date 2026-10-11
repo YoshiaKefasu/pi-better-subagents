@@ -165,15 +165,25 @@ describe("PR #164 nested agents through the real print-mode boundary", () => {
           observed.set(route, tools(ctx));
           return "PLAIN_CHILD_RESULT";
         }
+        // Detached root spawn: fetch the child's answer by the id it handed back.
+        if (toolResults(ctx, "get_subagent_result").length > 0) {
+          return lastToolResult(ctx, "get_subagent_result");
+        }
         if (toolResults(ctx, "Agent").length === 0) {
           return agentCall({
             subagent_type: "plain",
             description: "plain child",
             prompt: "plain-child",
-            run_in_background: false,
+            run_in_background: true,
           });
         }
-        return lastToolResult(ctx, "Agent");
+        const plainId = toolResults(ctx, "Agent")[0].match(/Agent ID: ([^\s]+)/)?.[1];
+        if (!plainId) throw new Error(`No agent ID in: ${toolResults(ctx, "Agent")[0]}`);
+        return toolCall(
+          "get_subagent_result",
+          { agent_id: plainId, wait: true },
+          "get-plain-result",
+        );
       },
       { prompt: "root-default" },
     ));
@@ -214,15 +224,26 @@ describe("PR #164 nested agents through the real print-mode boundary", () => {
           }
           return lastToolResult(ctx, "Agent");
         }
+        // Detached root spawn, same as above: the nested hop below still returns
+        // inline, which is what this case is about.
+        if (toolResults(ctx, "get_subagent_result").length > 0) {
+          return lastToolResult(ctx, "get_subagent_result");
+        }
         if (toolResults(ctx, "Agent").length === 0) {
           return agentCall({
             subagent_type: "level_one",
             description: "recursive chain",
             prompt: "level_one-child",
-            run_in_background: false,
+            run_in_background: true,
           });
         }
-        return lastToolResult(ctx, "Agent");
+        const levelOneId = toolResults(ctx, "Agent")[0].match(/Agent ID: ([^\s]+)/)?.[1];
+        if (!levelOneId) throw new Error(`No agent ID in: ${toolResults(ctx, "Agent")[0]}`);
+        return toolCall(
+          "get_subagent_result",
+          { agent_id: levelOneId, wait: true },
+          "get-level-one-result",
+        );
       },
       { prompt: "root-depth", maxModelCalls: 24 },
     ));

@@ -139,21 +139,21 @@ describe("nested delegation e2e (real pi-mono, faux model)", () => {
       const spawned = context.messages.some(
         (m) => m.role === "toolResult" && (m as { toolName?: string }).toolName === "Agent",
       );
+      // Every spawn is detached now, so the parent reads its child's answer by
+      // polling for the id the spawn handed back — the same two turns any
+      // orchestrator spends on background work.
+      const polled = toolResultTexts(context).find((r) => r.name === "get_subagent_result")?.text;
+      if (polled !== undefined) return `parent saw: ${polled}`;
       if (spawned) {
-        const result = [...context.messages]
-          .reverse()
-          .find((m) => m.role === "toolResult" && (m as { toolName?: string }).toolName === "Agent");
-        const inner = ((result?.content ?? []) as Array<{ text?: string }>)
-          .map((b) => b.text ?? "")
-          .join("");
-        return `parent saw: ${inner}`;
+        const id = /Agent ID:\s*(\S+)/.exec(spawned)?.[1];
+        expect(id).toBeTruthy();
+        return fauxToolCall("get_subagent_result", { agent_id: id, wait: true });
       }
       return agentCall({
         subagent_type: "orchestrator",
         description: "delegate",
         prompt: "Delegate this downward.",
-        // Foreground: this test reads the parent's inline Agent tool result.
-        run_in_background: false,
+        run_in_background: true,
       });
     };
 
@@ -214,13 +214,21 @@ describe("nested delegation e2e (real pi-mono, faux model)", () => {
         });
       }
 
-      if (toolResultTexts(context).some((r) => r.name === "Agent")) return "parent done";
+      const parentPolled = toolResultTexts(context).find((r) => r.name === "get_subagent_result")?.text;
+      if (parentPolled !== undefined) return `parent saw: ${parentPolled}`;
+      if (toolResultTexts(context).some((r) => r.name === "Agent")) {
+        // The orchestrator's answer now arrives as a notification, so fetch it
+        // by the id its spawn handed back.
+        const spawned = toolResultTexts(context).find((r) => r.name === "Agent")?.text ?? "";
+        const id = /Agent ID:\s*(\S+)/.exec(spawned)?.[1];
+        expect(id).toBeTruthy();
+        return fauxToolCall("get_subagent_result", { agent_id: id, wait: true });
+      }
       return agentCall({
         subagent_type: "orchestrator",
         description: "delegate",
         prompt: "Delegate this downward.",
-        // Foreground: this test reads the parent's inline Agent tool result.
-        run_in_background: false,
+        run_in_background: true,
       });
     };
 

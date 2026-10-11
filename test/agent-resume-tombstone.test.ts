@@ -128,14 +128,17 @@ describe("Agent tool resume from a tombstone", () => {
 
     const result = await tools.get("Agent").execute(
       "tc-resume",
-      { prompt: "follow-up", description: "Follow-up", subagent_type: "Explore", resume: handle, run_in_background: false },
+      { prompt: "follow-up", description: "Follow-up", subagent_type: "Explore", resume: handle },
       undefined,
       undefined,
       ctx(),
     );
     await flush();
 
-    expect(textOf(result)).toContain("resumed answer");
+    // Reopen is detached like every other spawn: the answer arrives in the
+    // completion notification, and this call hands back an id.
+    expect(textOf(result)).toContain("resumed from disk in background");
+    expect(textOf(result)).toContain("Agent ID:");
     expect(textOf(result)).not.toContain("Agent not found");
     expect(vi.mocked(runAgent)).toHaveBeenCalledTimes(1);
     expect(vi.mocked(runAgent).mock.calls[0][1]).toBe("Explore");
@@ -160,14 +163,14 @@ describe("Agent tool resume from a tombstone", () => {
 
     const result = await tools.get("Agent").execute(
       "tc-resume",
-      { prompt: "follow-up", description: "Follow-up", subagent_type: "Explore", resume: alias, run_in_background: false },
+      { prompt: "follow-up", description: "Follow-up", subagent_type: "Explore", resume: alias },
       undefined,
       undefined,
       ctx(),
     );
     await flush();
 
-    expect(textOf(result)).toContain("resumed answer");
+    expect(textOf(result)).toContain("resumed from disk in background");
     const resumedId = (vi.mocked(runAgent).mock.calls[0][3] as any).agentId;
     expect(manager.getRecord(resumedId).alias).toBe(alias);
   });
@@ -182,7 +185,7 @@ describe("Agent tool resume from a tombstone", () => {
 
     const result = await tools.get("Agent").execute(
       "tc-resume",
-      { prompt: "follow-up", description: "Follow-up", subagent_type: "Explore", resume: handle, run_in_background: false },
+      { prompt: "follow-up", description: "Follow-up", subagent_type: "Explore", resume: handle },
       undefined,
       undefined,
       ctx(),

@@ -63,10 +63,15 @@ function toolResultNames(context: Context): string[] {
     .map((m) => (m as { toolName?: string }).toolName ?? "");
 }
 
-/** Every Agent tool result the parent session received, concatenated. */
+/**
+ * Every result the parent session received about its child, concatenated —
+ * the spawn receipt AND the poll that follows it, since a detached spawn only
+ * hands back an id and the child's output arrives on the second call.
+ */
 function agentResultText(session: Context): string {
   return session.messages
-    .filter((m) => m.role === "toolResult" && (m as { toolName?: string }).toolName === "Agent")
+    .filter((m) => m.role === "toolResult")
+    .filter((m) => ["Agent", "get_subagent_result"].includes((m as { toolName?: string }).toolName ?? ""))
     .flatMap((m) => ((m.content ?? []) as Array<{ text?: string }>).map((b) => b.text ?? ""))
     .join("\n");
 }
@@ -87,15 +92,18 @@ function respondSpawning(isolation: "worktree" | undefined): (context: Context) 
       }
       return CHILD_MARKER;
     }
-    // Parent: spawn once, then echo the tool result so a lost one fails loudly.
-    if (toolResultNames(context).includes("Agent")) {
+    // Parent: spawn detached, then poll the id it handed back — the shape every
+    // orchestrator spends on background work now.
+    if (toolResultNames(context).includes("get_subagent_result")) {
       return `parent saw: ${agentResultText(context)}`;
     }
+    if (toolResultNames(context).includes("Agent")) {
+      const id = agentResultText(context).match(/Agent ID: ([^\s]+)/)?.[1];
+      if (!id) throw new Error(`No agent ID in: ${agentResultText(context)}`);
+      return fauxToolCall("get_subagent_result", { agent_id: id, wait: true });
+    }
     return agentCall({
-      // Foreground: this test reads the child's marker out of the parent's
-      // inline Agent tool result, which a background spawn replaces with a
-      // "started in background" receipt.
-      run_in_background: false,
+      run_in_background: true,
       description: "worktree work",
       prompt: CHILD_PROMPT,
       ...(isolation ? { isolation } : {}),

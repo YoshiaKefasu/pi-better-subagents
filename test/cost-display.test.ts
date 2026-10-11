@@ -5,7 +5,7 @@
  * Two rules run through all of it. A cost is shown only when there is one to
  * show: a model pi has no rates for reports 0, and printing `$0.00` beside its
  * tokens would claim the run was measured and free. And each surface punctuates
- * its own — the stats line joins with `·`, the foreground result with `,`, the
+ * its own — the stats line joins with `·`, `get_subagent_result` with `|`, the
  * `get_subagent_result` header with `|` — which is why the cost travels as a
  * number and is formatted at the end, not baked into the token string.
  */
@@ -23,7 +23,7 @@ import { ctx, flush, type Hermetic, hermeticDir, makePi, textOf } from "./helper
 
 const COST = 0.0123;
 
-/** One foreground run that spends `cost` on a single assistant message. */
+/** One run that spends `cost` on a single assistant message. */
 function runSpending(cost: number) {
   vi.mocked(runAgent).mockImplementation(async (_c: any, _t: any, _p: any, opts: any) => {
     opts.onAssistantUsage?.({ input: 1000, output: 200, cacheWrite: 0, cost });
@@ -58,33 +58,21 @@ describe("cost display", () => {
     hermetic?.restore();
   });
 
-  describe("the foreground result the orchestrator reads", () => {
-    it("names the cost in the stats it already reports", async () => {
-      const { tools } = boot({ showCost: true });
-      runSpending(COST);
+  // The Agent tool result is a detached handoff now: no stats line, so no cost
+  // and no tokens on it under any setting. The two surfaces that do carry a
+  // cost are asserted below — get_subagent_result and the completion
+  // notification — and those are the ones the orchestrator actually reads.
+  describe("the detached Agent tool result", () => {
+    it("carries no cost either way, on or off", async () => {
+      for (const showCost of [true, false]) {
+        const { tools } = boot({ showCost });
+        runSpending(COST);
 
-      const text = textOf(await spawn(tools));
+        const text = textOf(await spawn(tools));
 
-      expect(text).toContain("~$0.0123");
-      // Comma-joined with the rest, not glued to the token count with the "·"
-      // that the widget uses — the separator belongs to the surface.
-      expect(text).toMatch(/1\.2k token, ~\$0\.0123/);
-    });
-
-    it("says nothing when the setting is off", async () => {
-      const { tools } = boot({ showCost: false });
-      runSpending(COST);
-
-      expect(textOf(await spawn(tools))).not.toContain("$");
-    });
-
-    it("says nothing for a model with no pricing data", async () => {
-      const { tools } = boot({ showCost: true });
-      runSpending(0);
-
-      const text = textOf(await spawn(tools));
-      expect(text).toContain("1.2k token");   // tokens are still exact
-      expect(text).not.toContain("$");
+        expect(text).toContain("started in background");
+        expect(text).not.toContain("$");
+      }
     });
   });
 
@@ -95,8 +83,8 @@ describe("cost display", () => {
       await spawn(tools);
       await flush();
 
-      // The agent above ran in the foreground; look it up by the handle its
-      // type gets, which is how the orchestrator would reach it.
+      // The agent above ran detached; look it up by the handle its type gets,
+      // which is how the orchestrator would reach it.
       const text = textOf(await tools.get("get_subagent_result").execute(
         "tc-2", { agent_id: "general-purpose" }, undefined, undefined, ctx(),
       ));

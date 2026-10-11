@@ -1,6 +1,6 @@
 /**
- * foreground-concurrency-print-mode-e2e.test.ts — does `maxConcurrentForeground`
- * actually serialize a turn's blocking `Agent` calls, end to end?
+ * concurrency-print-mode-e2e.test.ts — does `maxConcurrent` actually serialize a
+ * turn's `Agent` calls, end to end?
  *
  * The unit and wiring tests call the tool's `execute` directly, twice, without
  * awaiting the first. That MODELS pi's parallel dispatch; it does not prove the
@@ -12,9 +12,14 @@
  * in-flight counter, holds for a real interval, then decrements. Two agents
  * running at once drive `maxInFlight` to 2; serialized ones leave it at 1.
  *
- * The unlimited control case is what makes the limited one meaningful — it
- * proves the detector can see parallelism at all, so `maxInFlight === 1` is a
- * result rather than a broken probe.
+ * The roomy control case is what makes the limited one meaningful — it proves
+ * the detector can see parallelism at all, so `maxInFlight === 1` is a result
+ * rather than a broken probe.
+ *
+ * Every spawn is detached now, so a queued agent does not merely run later — it
+ * does not START at all, which is a strictly stronger signal than the overlap
+ * counter alone. The parent fetches each result by the id its own receipt
+ * handed back, which is the only way a detached result reaches it.
  */
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -23,9 +28,9 @@ import type { Context } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   agentCall,
-  agentToolResults,
   type PrintModeRun,
   runPrintMode,
+  toolResultsNamed,
 } from "./helpers/print-mode-runner.js";
 
 // Real pi-mono: loader, dynamic extension import, three live sessions.
@@ -36,7 +41,7 @@ const LIVE = /^(1|true|yes)$/i.test(process.env.PI_E2E_LIVE ?? "");
 /** How long each child holds the model call — long enough to overlap detectably. */
 const CHILD_HOLD_MS = 120;
 
-describe.skipIf(LIVE)("maxConcurrentForeground e2e (real pi agent loop)", () => {
+describe.skipIf(LIVE)("maxConcurrent e2e (real pi agent loop)", () => {
   let run: PrintModeRun | undefined;
   const tmpDirs: string[] = [];
 
@@ -47,7 +52,7 @@ describe.skipIf(LIVE)("maxConcurrentForeground e2e (real pi agent loop)", () => 
   });
 
   function projectDir(settings: Record<string, unknown>): string {
-    const dir = mkdtempSync(join(tmpdir(), "pi-fgconc-e2e-"));
+    const dir = mkdtempSync(join(tmpdir(), "pi-conc-e2e-"));
     tmpDirs.push(dir);
     mkdirSync(join(dir, ".pi"), { recursive: true });
     writeFileSync(
@@ -58,11 +63,11 @@ describe.skipIf(LIVE)("maxConcurrentForeground e2e (real pi agent loop)", () => 
   }
 
   /**
-   * One parent turn emitting two BLOCKING Agent calls in a single message —
-   * the shape pi dispatches through Promise.all — plus a child responder that
-   * measures how many children are in flight at once.
+   * One parent turn emitting two Agent calls in a single message — the shape pi
+   * dispatches through Promise.all — plus a child responder that measures how
+   * many children are in flight at once.
    */
-  async function twoBlockingAgents(settings: Record<string, unknown>) {
+  async function twoDetachedAgents(settings: Record<string, unknown>) {
     let inFlight = 0;
     let maxInFlight = 0;
     const order: string[] = [];
@@ -72,18 +77,44 @@ describe.skipIf(LIVE)("maxConcurrentForeground e2e (real pi agent loop)", () => 
       cwd: projectDir(settings),
       live: false, // scripted on purpose: a real model may not emit both calls
       respond: async (context: Context) => {
-        const isParent = (context.tools ?? []).some(t => t.name === "Agent");
-        if (isParent) {
-          const alreadySpawned = context.messages.some(
+        // Routed on the session's own prompt, not on its tool set: the root
+        // session's faux `context.tools` is empty in this runner, which is what
+        // left this file's routing inverted before.
+        const first = context.messages.find((m) => m.role === "user");
+        const firstContent = first?.content;
+        const firstText = typeof firstContent === "string"
+          ? firstContent
+          : ((firstContent ?? []) as Array<{ text?: string }>).map((b) => b.text ?? "").join("");
+        if (firstText.includes("Delegate two independent jobs")) {
+          const spawned = context.messages.filter(
             m => m.role === "toolResult" && (m as { toolName?: string }).toolName === "Agent",
           );
-          if (alreadySpawned) return "Both jobs are done.";
-          // TWO tool calls, ONE assistant message — exactly what the Agent tool
-          // description tells the model to send for parallel work.
-          return [
-            agentCall({ prompt: "JOB-ALPHA", description: "alpha", run_in_background: false }),
-            agentCall({ prompt: "JOB-BETA", description: "beta", run_in_background: false }),
-          ];
+          const polled = context.messages.filter(
+            m => m.role === "toolResult" && (m as { toolName?: string }).toolName === "get_subagent_result",
+          );
+          if (polled.length >= 2) return "Both jobs are done.";
+          if (spawned.length === 0) {
+            // TWO tool calls, ONE assistant message — exactly what the Agent tool
+            // description tells the model to send for parallel work.
+            return [
+              agentCall({ prompt: "JOB-ALPHA", description: "alpha" }),
+              agentCall({ prompt: "JOB-BETA", description: "beta" }),
+            ];
+          }
+          // Fetch each by the id its own receipt handed back. One call per turn
+          // keeps the sequence unambiguous; `wait: true` is what a real
+          // orchestrator uses for work it needs before continuing.
+          const index = polled.length;
+          const receipt = (spawned[index].content as Array<{ text?: string }>)
+            .map(b => b.text ?? "").join("");
+          const id = /Agent ID: (\S+)/.exec(receipt)?.[1];
+          if (!id) throw new Error(`No agent ID in receipt ${index}: ${receipt}`);
+          return {
+            type: "toolCall",
+            id: `poll-${index}`,
+            name: "get_subagent_result",
+            arguments: { agent_id: id, wait: true },
+          } as never;
         }
 
         // A child. Hold the model call so genuine overlap is observable.
@@ -101,17 +132,17 @@ describe.skipIf(LIVE)("maxConcurrentForeground e2e (real pi agent loop)", () => 
     return { maxInFlight, order };
   }
 
-  it("runs a turn's two blocking Agent calls one at a time when the limit is 1", async () => {
-    const { maxInFlight, order } = await twoBlockingAgents({ maxConcurrentForeground: 1 });
+  it("runs a turn's two Agent calls one at a time when the limit is 1", async () => {
+    const { maxInFlight, order } = await twoDetachedAgents({ maxConcurrent: 1 });
 
     expect(maxInFlight).toBe(1);
     // Strictly serialized: the first child ends before the second begins.
     expect(order).toHaveLength(4);
     expect(order[1]).toBe(order[0].replace("start:", "end:"));
 
-    // Serialization must not cost anyone their result — each call still returns
-    // its own agent's output to the parent.
-    const results = agentToolResults(run!.parentSession).join("\n");
+    // Serialization must not cost anyone their result — the second agent still
+    // runs once the slot frees, and the parent reads both by id.
+    const results = toolResultsNamed(run!.parentSession, "get_subagent_result").join("\n");
     expect(results).toContain("ALPHA-RESULT");
     expect(results).toContain("BETA-RESULT");
 
@@ -122,14 +153,14 @@ describe.skipIf(LIVE)("maxConcurrentForeground e2e (real pi agent loop)", () => 
 
   // The control. Without this, the assertion above could pass on a detector
   // that never observes overlap in the first place.
-  it("runs them concurrently when the limit is unset — the detector works", async () => {
-    const { maxInFlight, order } = await twoBlockingAgents({ maxConcurrentForeground: 0 });
+  it("runs them concurrently when the pool is roomy — the detector works", async () => {
+    const { maxInFlight, order } = await twoDetachedAgents({ maxConcurrent: 10 });
 
     expect(maxInFlight).toBe(2);
     // Interleaved: both start before either ends.
     expect(order.slice(0, 2).every(e => e.startsWith("start:"))).toBe(true);
 
-    const results = agentToolResults(run!.parentSession).join("\n");
+    const results = toolResultsNamed(run!.parentSession, "get_subagent_result").join("\n");
     expect(results).toContain("ALPHA-RESULT");
     expect(results).toContain("BETA-RESULT");
   });

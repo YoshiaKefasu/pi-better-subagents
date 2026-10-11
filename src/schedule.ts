@@ -268,7 +268,6 @@ export class SubagentScheduler {
           // and rendering it as "max turns: 0" would read as a limit of none.
           maxTurns: normalizeMaxTurns(job.max_turns),
           isolated: job.isolated,
-          runInBackground: true,
           isolation: job.isolation,
         },
       });

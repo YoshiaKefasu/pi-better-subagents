@@ -118,11 +118,11 @@ function ownsRecord(record: AgentRecord | undefined, parentAgentId: string): rec
 /**
  * How the caller received this record, which decides the outcome wording.
  *
- *   - "inline": a foreground spawn or a resume. The full output is in this very
+ *   - "inline": an inline spawn or a resume. The full output is in this very
  *     result and no agent id was handed back, so the note must say there is
  *     nothing left to fetch — otherwise the parent invents an id, calls
  *     `get_subagent_result`, and hits "not owned by this parent" (#174, the same
- *     trap the top-level foreground path fell into).
+ *     trap the top-level path fell into).
  *   - "fetched": `get_subagent_result` on a background child. The parent holds a
  *     valid id and can poll again, so the background wording applies.
  */
@@ -175,7 +175,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       max_turns: Type.Optional(Type.Number({ minimum: 1 })),
       run_in_background: Type.Optional(
         Type.Boolean({
-          description: "Defaults to false for nested spawns — the call blocks and returns the child's result inline. Set true only for work you will collect later with get_subagent_result; a detached child is stopped when you finish.",
+          description: "Defaults to inline for nested spawns — the call blocks and returns the child's result. Set true only for work you will collect later with get_subagent_result; a detached child is stopped when you finish.",
         }),
       ),
       resume: Type.Optional(Type.String({ description: "Resume a nested agent owned by this parent." })),
@@ -241,11 +241,13 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       }
 
       const config = getAgentConfigIn(registry, resolvedType);
-      // Foreground regardless of `backgroundByDefault` — see the reasoning on
-      // ResolveOptions. An explicit `true` here still opts in.
+      // Nested spawns stay inline by default — see `ResultPosition` below. An
+      // explicit `run_in_background: true` opts into a detached child; nothing
+      // else may, because a detached child is killed by `abortOwnedChildren`
+      // when its parent settles and has no notification path of its own, so
+      // backgrounding one loses its work.
       const invocation = resolveAgentInvocationConfig(config, params, {
         worktreeAllowed: isWorktreeIsolationEnabled(),
-        defaultRunInBackground: false,
       });
       let model = ctx.model;
       let modelFallbacks: string[] | undefined;
@@ -292,7 +294,6 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
           maxTurns: invocation.maxTurns,
           isolated: invocation.isolated,
           inheritContext: invocation.inheritContext,
-          runInBackground: invocation.runInBackground,
           isolation: invocation.isolation,
         },
         // Nested children are hidden from every reporting surface, so their spend
@@ -357,7 +358,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       // report it as a tool error, like the top-level Agent tool does, instead of
       // letting it escape into the child's turn.
       try {
-        if (invocation.runInBackground) {
+        if (params.run_in_background === true) {
           const id = context.manager.spawn(context.pi, ctx, resolvedType, params.prompt, {
             ...options,
             isBackground: true,

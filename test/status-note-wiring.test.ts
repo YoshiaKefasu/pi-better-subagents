@@ -13,6 +13,12 @@ vi.mock("../src/agent-runner.js", async () => {
 
 import { runAgent } from "../src/agent-runner.js";
 import subagentsExtension from "../src/index.js";
+import { createNestedSubagentTools } from "../src/nested-tools.js";
+
+// The nested tool builds its registry from this repo's agents (the embedded
+// defaults plus whatever a checkout has in .pi/agents), so `Explore` resolves
+// without any fixture of our own.
+const configCwd = process.cwd();
 
 function makePi() {
   const tools = new Map<string, any>();
@@ -62,26 +68,62 @@ function ctx() {
 
 const textOf = (r: any): string => r.content[0].text;
 
+/**
+ * The nested delegation tool, wired to a manager whose `spawnAndWait` hands
+ * back the record it is told to. The inline outcome note is only reachable
+ * through this path now (see the two tests below), so it is driven directly
+ * rather than through a parent agent's whole turn.
+ */
+function nestedTools(settled: { status: string; result: string }) {
+  const records = new Map<string, any>();
+  const spawnAndWait = vi.fn(async () => {
+    const record = { id: "child-1", type: "scout", ...settled, parentAgentId: "parent-1" };
+    records.set(record.id, record);
+    return { id: record.id, record };
+  });
+  const manager = {
+    spawn: vi.fn(),
+    spawnAndWait,
+    awaitStartup: vi.fn(async () => {}),
+    getRecord: (id: string) => records.get(id),
+    resume: vi.fn(),
+  } as any;
+  const [agent] = createNestedSubagentTools({
+    manager,
+    pi: {} as any,
+    parentAgentId: "parent-1",
+    depth: 1,
+    maxSubagentDepth: 2,
+    allowedSubagents: "all",
+    configCwd,
+  });
+  return {
+    execute: (params: Record<string, unknown>) =>
+      agent.execute("call-1", params, undefined, undefined, {
+        cwd: configCwd,
+        model: undefined,
+        modelRegistry: { find: () => ({ provider: "anthropic", id: "allowed" }), getAvailable: () => [] },
+      } as any),
+  };
+}
+
 describe("status note reaches the parent through the real handlers", () => {
   afterEach(() => {
     delete (globalThis as any)[Symbol.for("pi-subagents:manager")];
     vi.restoreAllMocks();
   });
 
-  it("foreground turn-limit abort → the Agent result flags an incomplete outcome", async () => {
-    vi.mocked(runAgent).mockResolvedValue({
-      responseText: "partial work so far",
-      session: { dispose: vi.fn() } as any,
-      aborted: true, // hard turn-limit abort
-      steered: false,
-    });
-    const { pi, tools } = makePi();
-    subagentsExtension(pi);
+  // The inline status note survives exactly one caller: nested delegation,
+  // whose only way back to its parent is the child's own tool result. A
+  // top-level spawn is detached now, so the Agent tool result there never
+  // carries an outcome note at all — that path is covered below through
+  // get_subagent_result.
+  it("inline turn-limit abort → the nested Agent result flags an incomplete outcome", async () => {
+    const nested = nestedTools({ status: "aborted", result: "partial work so far" });
 
-    const res = await tools.get("Agent").execute(
-      "tc1",
-      { prompt: "go", description: "d", subagent_type: "general-purpose", run_in_background: false },
-      undefined, undefined, ctx(),
+    const res = await nested.execute(
+      { subagent_type: "Explore", description: "d", prompt: "go" },
+      {},
     );
 
     const out = textOf(res);
@@ -91,7 +133,7 @@ describe("status note reaches the parent through the real handlers", () => {
     expect(out).toContain("partial work so far");     // partial result still delivered
     expect(out).not.toContain("STOPPED BY THE USER"); // not mislabelled as a user stop
 
-    // The two answers a foreground parent needs: is this all of it, and is the
+    // The two answers an inline parent needs: is this all of it, and is the
     // task done. The first is what #174 turned on — the parent has no agent id,
     // so it must not read "partial" as "go fetch the rest".
     expect(out).toContain("everything the agent produced is above");
@@ -103,34 +145,18 @@ describe("status note reaches the parent through the real handlers", () => {
     expect(out).not.toContain("get_subagent_result");
   });
 
-  it("foreground user-stop → tells the parent NOT to restart it unasked", async () => {
-    // Pi delivers a user ESC as an abort on the tool's signal; the manager wires
-    // that to abort(id) (#44), landing the record on "stopped" — deliberately
-    // distinct from a turn-limit "aborted", because the correct next action is
-    // the opposite one.
-    let finish: (v: any) => void = () => {};
-    vi.mocked(runAgent).mockReturnValue(new Promise((r) => { finish = r; }) as any);
+  it("inline user-stop → tells the parent NOT to restart it unasked", async () => {
+    // A user ESC lands the record on "stopped" (#44) — deliberately distinct
+    // from a turn-limit "aborted", because the correct next action is the
+    // opposite one.
+    const nested = nestedTools({ status: "stopped", result: "partial work so far" });
 
-    const { pi, tools } = makePi();
-    subagentsExtension(pi);
-
-    const parent = new AbortController();
-    const call = tools.get("Agent").execute(
-      "tc-stop",
-      { prompt: "go", description: "d", subagent_type: "general-purpose", run_in_background: false },
-      parent.signal, undefined, ctx(),
+    const res = await nested.execute(
+      { subagent_type: "Explore", description: "d", prompt: "go" },
+      {},
     );
 
-    // The manager only wires addEventListener("abort", …) and never checks
-    // signal.aborted upfront (agent-manager.ts:240-243), so aborting before the
-    // listener is attached would silently land on "completed" instead. Flush
-    // first rather than relying on spawn() happening in execute()'s synchronous
-    // prefix, which any future await in that path would quietly break.
-    await new Promise((r) => setImmediate(r));
-    parent.abort(); // the user hits ESC
-    finish({ responseText: "partial work so far", session: { dispose: vi.fn() }, aborted: false, steered: false });
-
-    const out = textOf(await call);
+    const out = textOf(res);
     expect(out).toContain("STOPPED BY THE USER");
     expect(out).toContain("everything the agent produced is above");
     // Same claim, same confidence, same words as the aborted case — only the

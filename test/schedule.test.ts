@@ -343,7 +343,6 @@ describe("SubagentScheduler — fire path", () => {
       thinking: "high",
       maxTurns: 12,
       isolated: true,
-      runInBackground: true,
       isolation: undefined,
     });
   });

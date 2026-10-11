@@ -1,10 +1,10 @@
-import { Type } from "@sinclair/typebox";
 import type { Model } from "@earendil-works/pi-ai";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
-import type { AgentConfig, AgentInvocation, IsolationMode, JoinMode, ThinkingLevel } from "./types.js";
+import { Type } from "@sinclair/typebox";
 import { parseModelChain } from "./model-fallback-chain.js";
 import { describeModel, type ModelRegistry, resolveModel } from "./model-resolver.js";
 import { checkModelScope } from "./model-scope.js";
+import type { AgentConfig, AgentInvocation, IsolationMode, ThinkingLevel } from "./types.js";
 
 /**
  * The model-facing `isolation` parameter, shared by the `Agent` tool and the
@@ -63,7 +63,6 @@ interface AgentInvocationParams {
   model?: string;
   thinking?: string;
   max_turns?: number;
-  run_in_background?: boolean;
   inherit_context?: boolean;
   isolated?: boolean;
   /**
@@ -85,17 +84,6 @@ interface ResolveOptions {
    * calls the `"off"` value exists to tolerate. Defaults to allowed.
    */
   worktreeAllowed?: boolean;
-  /**
-   * What an unqualified spawn means — neither the call nor the agent file said.
-   *
-   * Top-level callers pass the `backgroundByDefault` setting (default `true`,
-   * following Claude Code). Nested callers pass `false` unconditionally: a
-   * detached child is killed by `abortOwnedChildren` when its parent settles
-   * and has no notification path of its own, so backgrounding one loses its
-   * work. Both call sites pass it explicitly; the `false` fallback only covers
-   * a caller that supplies no options at all, which in-tree means tests.
-   */
-  defaultRunInBackground?: boolean;
 }
 
 export function resolveAgentInvocationConfig(
@@ -108,7 +96,6 @@ export function resolveAgentInvocationConfig(
   thinking?: ThinkingLevel;
   maxTurns?: number;
   inheritContext: boolean;
-  runInBackground: boolean;
   isolated: boolean;
   isolation?: IsolationMode;
   /**
@@ -140,15 +127,10 @@ export function resolveAgentInvocationConfig(
     thinking,
     maxTurns: agentConfig?.maxTurns ?? params.max_turns,
     inheritContext: agentConfig?.inheritContext ?? params.inherit_context ?? false,
-    runInBackground: agentConfig?.runInBackground ?? params.run_in_background ?? opts?.defaultRunInBackground ?? false,
     isolated: agentConfig?.isolated ?? params.isolated ?? false,
     isolation,
     overridden: undefined,
   };
-}
-
-export function resolveJoinMode(defaultJoinMode: JoinMode, runInBackground: boolean): JoinMode | undefined {
-  return runInBackground ? defaultJoinMode : undefined;
 }
 
 /**

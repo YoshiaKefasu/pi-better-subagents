@@ -20,9 +20,9 @@ vi.mock("../src/agent-runner.js", async () => {
 });
 
 import { resumeAgent, runAgent } from "../src/agent-runner.js";
-import { applyResumeModel } from "../src/invocation-config.js";
 import { registerAgents } from "../src/agent-types.js";
 import subagentsExtension from "../src/index.js";
+import { applyResumeModel } from "../src/invocation-config.js";
 
 function agentTool() {
   const tools = new Map<string, any>();
@@ -69,6 +69,9 @@ function session(provider: string, id: string, thinkingLevel: string, name?: str
     setModel: vi.fn(),
     setThinkingLevel: vi.fn(),
     dispose: vi.fn(),
+    // The detached resume reads this to anchor streaming past what is already
+    // on disk, so a stub session must carry it.
+    messages: [],
   } as never;
 }
 
@@ -88,6 +91,16 @@ function render(tool: any, result: any, expanded = false): string {
     theme,
     { isError: false },
   ).render(200).join("\n");
+}
+
+/**
+ * The same result as it renders once the detached agent has FINISHED. The
+ * handoff itself renders as "Running in background (ID: …)" — that line is the
+ * whole point of a detached spawn and carries no stats — so the model/tag line
+ * is asserted on the completed render, which is where it lives.
+ */
+function renderSettled(tool: any, result: any, expanded = false): string {
+  return render(tool, { ...result, details: { ...result.details, status: "completed" } }, expanded);
 }
 
 /**
@@ -149,35 +162,28 @@ describe("Agent tool result — effective model", () => {
     );
 
     expect(result.details.modelName).toBe("opus 4.6");
-    expect(render(tool, result)).toContain("opus 4.6");
-    expect(render(tool, result, true)).toContain("opus 4.6");
+    expect(renderSettled(tool, result)).toContain("opus 4.6");
+    expect(renderSettled(tool, result, true)).toContain("opus 4.6");
   });
 
-  it("names the inherited model while streaming, before a session exists", async () => {
-    // The streaming row renders from the pre-session snapshot, which the old
-    // "only when it differs from the parent" rule left empty for every agent
-    // that inherited — the level had nothing to attach itself to.
-    vi.mocked(runAgent).mockImplementation(async (_c: any, _t: any, _p: any, options: any) => {
-      options.onToolActivity?.({ type: "start", toolName: "Read" });
-      const s = session("anthropic", "claude-opus-4-6", "high");
-      options.onSessionCreated?.(s);
-      return { responseText: "done", session: s, aborted: false, steered: false } as never;
-    });
+  it("names the inherited model in the handoff, before a session exists", async () => {
+    // The handoff result carries the pre-session snapshot, which the old "only
+    // when it differs from the parent" rule left empty for every agent that
+    // inherited — the level had nothing to attach itself to. The agent here
+    // never settles, so the snapshot is all there is.
+    vi.mocked(runAgent).mockReturnValue(new Promise(() => {}) as never);
     const tool = agentTool();
-    const onUpdate = vi.fn();
 
-    await tool.execute(
+    const result = await tool.execute(
       "tc-1b",
-      { prompt: "go", description: "d", subagent_type: "general-purpose", run_in_background: false },
+      { prompt: "go", description: "d", subagent_type: "general-purpose" },
       undefined,
-      onUpdate,
+      vi.fn(),
       ctx(),
     );
 
-    const streamed = onUpdate.mock.calls[0][0];
-    expect(streamed.details.modelName).toBe("opus 4.6");
-    expect(tool.renderResult(streamed, { expanded: false, isPartial: true }, theme, { isError: false })
-      .render(200).join("\n")).toContain("opus 4.6");
+    expect(result.details.modelName).toBe("opus 4.6");
+    expect(renderSettled(tool, result)).toContain("opus 4.6");
   });
 
   it("keeps the twin label beside the model", async () => {
@@ -199,7 +205,7 @@ describe("Agent tool result — effective model", () => {
     );
 
     expect(result.details.tags).toContain("twin");
-    expect(render(tool, result)).toContain("twin");
+    expect(renderSettled(tool, result)).toContain("twin");
   });
 
   it("reports the session's level, and what was asked for, when pi clamps it", async () => {
@@ -339,7 +345,7 @@ describe("Agent tool result — resume", () => {
 
     const first = await tool.execute(
       "tc-7",
-      { prompt: "go", description: "original", subagent_type: "general-purpose", run_in_background: false },
+      { prompt: "go", description: "original", subagent_type: "general-purpose" },
       undefined,
       vi.fn(),
       context,
@@ -351,7 +357,6 @@ describe("Agent tool result — resume", () => {
         prompt: "continue",
         description: "changed",
         subagent_type: "general-purpose",
-        run_in_background: false,
         model: "anthropic/claude-opus-4-6",
         thinking: "max",
         resume: first.details.agentId,
@@ -363,7 +368,7 @@ describe("Agent tool result — resume", () => {
 
     expect(resumed.details.modelName).toBe("opus 4.6");
     expect(resumed.details.tags).toContain("thinking: max");
-    expect(render(tool, resumed)).toContain("opus 4.6");
+    expect(renderSettled(tool, resumed)).toContain("opus 4.6");
     expect((s as any).setModel).toHaveBeenCalled();
     expect((s as any).setThinkingLevel).toHaveBeenCalledWith("max");
   });
