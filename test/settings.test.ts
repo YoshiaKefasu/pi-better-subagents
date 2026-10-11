@@ -95,6 +95,64 @@ describe("settings persistence", () => {
     expect(loadSettings(projectDir)).toEqual(settings);
   });
 
+  // Running pi from the home directory is the case where `projectPath(cwd)` is
+  // NOT a project file: it resolves to `~/.pi/subagents.json`, which sits next
+  // to the global `~/.pi/agent/subagents.json`. Reading it as a project
+  // override let a stale `rememberAgents: false` there shadow every global
+  // default, which is how every subagent ended up on an in-memory session.
+  describe("cwd is the agent dir's parent (running pi from ~)", () => {
+    // Recreate the real layout: agent dir at `<home>/.pi/agent`, so that
+    // `resolve(cwd, ".pi") === resolve(getAgentDir(), "..")`.
+    let home: string;
+
+    beforeEach(() => {
+      home = join(projectDir, "home");
+      process.env.PI_CODING_AGENT_DIR = join(home, ".pi", "agent");
+    });
+
+    afterEach(() => {
+      process.env.PI_CODING_AGENT_DIR = globalDir;
+    });
+
+    const globalSettings = () => join(home, ".pi", "agent", "subagents.json");
+    /** The shadow that used to win: `<home>/.pi/subagents.json`. */
+    const shadowSettings = () => join(home, ".pi", "subagents.json");
+
+    it("ignores a shadow file at ~/.pi/subagents.json", () => {
+      mkdirSync(join(home, ".pi", "agent"), { recursive: true });
+      writeFileSync(globalSettings(), JSON.stringify({ rememberAgents: true, maxConcurrent: 16 }));
+      mkdirSync(join(home, ".pi"), { recursive: true });
+      writeFileSync(shadowSettings(), JSON.stringify({ rememberAgents: false, maxConcurrent: 4 }));
+
+      expect(loadSettings(home)).toEqual({ rememberAgents: true, maxConcurrent: 16 });
+    });
+
+    it("saves to the global file instead of writing a new shadow", () => {
+      mkdirSync(join(home, ".pi", "agent"), { recursive: true });
+
+      expect(saveSettings({ rememberAgents: false }, home)).toBe(true);
+
+      expect(existsSync(globalSettings())).toBe(true);
+      expect(JSON.parse(readFileSync(globalSettings(), "utf-8"))).toEqual({ rememberAgents: false });
+      // The next load must not read its own write back as a project override.
+      expect(loadSettings(home)).toEqual({ rememberAgents: false });
+      expect(existsSync(shadowSettings())).toBe(false);
+    });
+
+    it("keeps treating a real project's .pi as a project override", () => {
+      // The identity check is exact: any other directory still has its own file.
+      const elsewhere = join(projectDir, "elsewhere");
+      mkdirSync(join(home, ".pi", "agent"), { recursive: true });
+      writeFileSync(globalSettings(), JSON.stringify({ maxConcurrent: 16 }));
+      writeProject({ maxConcurrent: 4 });
+      mkdirSync(join(elsewhere, ".pi"), { recursive: true });
+      writeFileSync(join(elsewhere, ".pi", "subagents.json"), JSON.stringify({ maxConcurrent: 2 }));
+
+      expect(loadSettings(projectDir)).toEqual({ maxConcurrent: 4 });
+      expect(loadSettings(elsewhere)).toEqual({ maxConcurrent: 2 });
+    });
+  });
+
   it("round-trips schedulingEnabled (true and false), and absence stays absent", () => {
     saveSettings({ schedulingEnabled: false }, projectDir);
     expect(loadSettings(projectDir)).toEqual({ schedulingEnabled: false });

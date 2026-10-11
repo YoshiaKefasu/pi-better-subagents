@@ -7,12 +7,11 @@ import { Type } from "@sinclair/typebox";
  * メインセッションには登録しない。agent-runner.ts が nested セッション
  * （`options.nestedRuntime` がある場合）のみに customTools として注入する。
  *
- * 保持キー: `handle ?? id`（= tombstone と同一キー）。
- * レコードが生きている間はもちろん、stop/abort や GC 後も tombstone が
- * 生きている限り ToDo は残る。破棄は (a) op=clear の明示クリア、
- * (b) tombstone 破棄時（上限追い出し・セッション切替・dropTombstone）に
- * agent-manager.ts から dropNestedTodos() が呼ばれる経路、のみ。
- * 永続化はしない（メモリ内のみ）。
+ * 保持キー: `handle ?? id`。
+ * レコードが生きている間（実行中・完了後 24 時間の保持期間中含む）ToDo は残る。
+ * 破棄は (a) op=clear の明示クリア、(b) レコード破棄時（GC・セッション切替）
+ * に agent-manager.ts の removeRecord から dropNestedTodos() が呼ばれる経路、
+ * のみ。永続化はしない（メモリ内のみ）。
  */
 
 /** nested セッションにだけ公開するツール名。NESTED_TOOL_NAMES ともメインの SUBAGENT_TOOL_NAMES とも衝突しない。 */
@@ -57,9 +56,9 @@ export interface NestedTodoContext {
 }
 
 /**
- * ToDo の保持キーを解決する。handle があるレコードは handle
- *（tombstone と同一キーなので、tombstone 経由 resume でも引き継がれる）、
- * ない nested レコードは id（stop→同ID resume で引き継がれる）。
+ * ToDo の保持キーを解決する。handle があるレコードは handle（disk reopen で
+ * reclaim されるため、resume 後も同じキーに戻る）、ない nested レコードは
+ * id（stop→同ID resume で引き継がれる）。
  */
 export function resolveNestedTodoKey(record: NestedTodoRecord): string {
   return record.handle ?? record.id;

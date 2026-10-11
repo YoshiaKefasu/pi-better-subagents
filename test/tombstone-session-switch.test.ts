@@ -1,13 +1,19 @@
 /**
- * tombstone-session-switch.test.ts — tombstone resume across the paths that
- * used to destroy it, through the REAL extension wiring.
+ * session-switch-resume.test.ts (file name kept from `tombstone-session-switch.test.ts`)
+ * — resume across the paths that used to destroy it, through the REAL extension
+ * wiring.
+ *
+ * The tombstone store this file used to pin is gone, so it now pins the
+ * replacement:
  *
  * 1. `session_start` (and `session_before_switch`, which calls the same
- *    `clearCompleted(true)`) no longer wipes tombstones: a GC-evicted agent
- *    stays resumable by handle after the switch.
- * 2. When pi's session-archive moves the transcript into `archive/`, both the
- *    tombstone resume and the fork-side `scanArchiveSessions` fallback still
- *    find it.
+ *    `clearCompleted(true)`) reaps the finished records from memory. The
+ *    conversations are not records — they are files, and a resume by id, handle
+ *    or alias still reopens one.
+ * 2. When pi's session-archive moves a transcript into `archive/`, the fork-side
+ *    `scanArchiveSessions` fallback still finds it, and a resume follows it
+ *    there. Archiving is ON by default now, so this is the normal path for a
+ *    transcript that has been idle a day.
  *
  * Booted through the real extension so the assertions cover the actual wiring,
  * mirroring `test/agent-resume-tombstone.test.ts` (which pins the pre-switch
@@ -63,19 +69,26 @@ function finishedRun(session: any, text = "first answer") {
   });
 }
 
-/** Boot the real extension. `outputTranscript: false` keeps the run off disk. */
+/**
+ * Boot the real extension. Settings are left at their defaults — `rememberAgents`
+ * and `outputTranscript` are both on, which is what leaves a session file and a
+ * transcript for the resume legs below to find.
+ */
 function boot(settings: Record<string, unknown> = {}) {
-  hermetic = hermeticDir({ settings: { outputTranscript: false, ...settings } });
+  hermetic = hermeticDir({ settings });
   const b = makePi();
   subagentsExtension(b.pi);
   booted = b.lifecycle;
   return b;
 }
 
-async function spawnBackground(tools: Map<string, any>): Promise<string> {
+async function spawnBackground(
+  tools: Map<string, any>,
+  extra: Record<string, unknown> = {},
+): Promise<string> {
   const r = await tools.get("Agent").execute(
     "tc-spawn",
-    { prompt: "go", description: "find flaky tests", subagent_type: "general-purpose", run_in_background: true },
+    { prompt: "go", description: "find flaky tests", subagent_type: "general-purpose", run_in_background: true, ...extra },
     undefined,
     undefined,
     ctx(),
@@ -85,80 +98,98 @@ async function spawnBackground(tools: Map<string, any>): Promise<string> {
 
 const managerOf = () => (globalThis as any)[Symbol.for("pi-subagents:manager")];
 
-/** Age the record past the cutoff and let the real GC evict it into a tombstone. */
-async function evict(id: string, sessionFile: string) {
-  const manager = managerOf();
-  const record = manager.getRecord(id);
-  record.sessionFile = sessionFile;
-  writeFileSync(sessionFile, "");
-  const handle = record.handle;
-  record.completedAt = Date.now() - 11 * 60_000;
-  await vi.advanceTimersByTimeAsync(60_000);
-  // Evicted from live memory (`resolveAgentRef` sees live records only),
-  // so whatever answers the resume below must come from the tombstone.
-  expect(manager.getRecord(id)).toBeUndefined();
-  expect(manager.resolveAgentRef(handle)).toBeUndefined();
-  return { manager, handle };
+/**
+ * Write a session file the way a persisted subagent session looks on disk: a v3
+ * header plus the `session_info` name the runner stamps (`type#handle#alias#id8`).
+ * That name is the only on-disk link from a `.jsonl` back to an agent, which is
+ * what makes a handle/alias resume possible once the record is gone.
+ */
+function writeSessionFile(path: string, agentId: string, names: (string | undefined)[]): void {
+  const now = new Date().toISOString();
+  const name = names.filter(Boolean).join("#");
+  writeFileSync(path, [
+    JSON.stringify({ type: "session", version: 3, id: agentId, timestamp: now, cwd: process.cwd() }),
+    JSON.stringify({ type: "session_info", id: "hdr00001", parentId: null, timestamp: now, name }),
+    JSON.stringify({ type: "message", id: "msg00001", parentId: "hdr00001", timestamp: now, message: { role: "user", content: [{ type: "text", text: "go" }] } }),
+  ].join("\n") + "\n", "utf-8");
 }
 
-async function resumeByHandle(tools: Map<string, any>, handle: string, sessionCtx: any) {
+/** Age a record past the retention window so the real GC reaps it. */
+async function reap(id: string, sessionFile?: string) {
+  const manager = managerOf();
+  const record = manager.getRecord(id);
+  if (sessionFile !== undefined) {
+    record.sessionFile = sessionFile;
+    writeFileSync(sessionFile, "");
+  }
+  record.completedAt = Date.now() - 25 * 60 * 60_000;
+  await vi.advanceTimersByTimeAsync(60_000);
+  // Reaped from live memory: whatever answers the resume below must come from
+  // disk, not from a record.
+  expect(manager.getRecord(id)).toBeUndefined();
+  return { manager, handle: record.handle, alias: record.alias };
+}
+
+async function resume(
+  tools: Map<string, any>,
+  query: string,
+  sessionCtx = ctx(),
+) {
   finishedRun(fakeSession(), "resumed answer");
   return tools.get("Agent").execute(
     "tc-resume",
-    { prompt: "follow-up", description: "Follow-up", subagent_type: "general-purpose", resume: handle },
+    { prompt: "follow-up", description: "Follow-up", subagent_type: "general-purpose", resume: query },
     undefined,
     undefined,
     sessionCtx,
   );
 }
 
-describe("tombstone resume across session boundaries", () => {
+describe("resume across session boundaries", () => {
   // Only the GC interval and Date are faked: `flush()` runs on setImmediate,
   // and the manager's cleanup timer is started in its constructor, so the
   // fake clock has to be installed before boot().
   beforeEach(() => vi.useFakeTimers({ toFake: ["setInterval", "Date"] }));
   afterEach(() => vi.useRealTimers());
 
-  it("stays resumable by handle after session_start (no more wipe on switch)", async () => {
+  it("stays resumable after session_start reaped the record", async () => {
     const { tools, lifecycle } = boot();
     finishedRun(fakeSession());
     const id = await spawnBackground(tools);
     await flush();
-    const sessionFile = join(process.cwd(), "switched-session.jsonl");
-    const { handle } = await evict(id, sessionFile);
+    await reap(id);
 
-    // The old behavior wiped every tombstone here; now they are kept —
-    // proved below by the resume answering from the tombstone, not `Agent not
-    // found`. (The registry facade exposes live records only, so the check
-    // has to go through the real resume path.)
+    // The session boundary: records go, files stay.
     await lifecycle.get("session_start")?.({}, ctx());
 
     vi.mocked(runAgent).mockClear();
-    const result = await resumeByHandle(tools, handle, ctx());
+    const result = await resume(tools, id.slice(0, 8));
     await flush();
 
-    // Detached reopen: the id comes back now, the answer in the notification.
     expect(textOf(result)).toContain("resumed from disk in background");
     expect(textOf(result)).toContain("Agent ID:");
     expect(textOf(result)).not.toContain("Agent not found");
+    // Rebuilt from the `.output` transcript, since this run left no session file.
     const resumeOpts = vi.mocked(runAgent).mock.calls[0][3] as any;
-    expect(resumeOpts.resumeSessionFile).toBe(sessionFile);
+    expect(resumeOpts.resumeSessionFile.endsWith(`recovered-${id}.jsonl`)).toBe(true);
     await lifecycle.get("session_shutdown")?.({}, ctx());
   });
 
   it("finds the transcript in archive/ after session-archive moved it", async () => {
     const { tools, lifecycle } = boot();
     finishedRun(fakeSession());
-    const id = await spawnBackground(tools);
+    const id = await spawnBackground(tools, { name: "auth-audit" });
     await flush();
     // sessionDir は pi が握る実ディレクトリ、archive/ はその配下という実配置。
     const sessionDir = mkdtempSync(join(tmpdir(), "pi-switch-sessiondir-"));
-    const sessionFile = join(process.cwd(), "archived-session.jsonl");
-    const { handle } = await evict(id, sessionFile);
+    const livePath = join(sessionDir, "sub.jsonl");
+    writeSessionFile(livePath, id, ["general-purpose", "general-purpose", "auth-audit", id.slice(0, 8)]);
+    const { alias } = await reap(id);
+    expect(alias).toBe("auth-audit");
     mkdirSync(join(sessionDir, "archive"), { recursive: true });
-    const archivedPath = join(sessionDir, "archive", "archived-session.jsonl");
-    renameSync(sessionFile, archivedPath);
-    expect(existsSync(sessionFile)).toBe(false);
+    const archivedPath = join(sessionDir, "archive", "sub.jsonl");
+    renameSync(livePath, archivedPath);
+    expect(existsSync(livePath)).toBe(false);
 
     const sessionCtx = ctx({
       sessionManager: {
@@ -168,17 +199,68 @@ describe("tombstone resume across session boundaries", () => {
       },
     });
     vi.mocked(runAgent).mockClear();
-    const result = await resumeByHandle(tools, handle, sessionCtx);
+    // Resumed by ALIAS: the session name is the only thing on disk that still
+    // carries it, and `scanArchiveSessions` is what reads that name back.
+    const result = await resume(tools, alias, sessionCtx);
     await flush();
 
-    // Detached reopen: the id comes back now, the answer in the notification.
     expect(textOf(result)).toContain("resumed from disk in background");
-    expect(textOf(result)).toContain("Agent ID:");
     expect(textOf(result)).not.toContain("Agent not found");
-    // archive sibling が reopen 元として渡される。
     const resumeOpts = vi.mocked(runAgent).mock.calls[0][3] as any;
     expect(resumeOpts.resumeSessionFile).toBe(archivedPath);
     await lifecycle.get("session_shutdown")?.({}, sessionCtx);
+  });
+
+  it("reopens by handle from a session file pi's own listing scans", async () => {
+    // The normal path for a persisted run: the session file sits in pi's
+    // session dir for the cwd, and its `session_info` name carries the agent's
+    // identity. Once the record is reaped, that name is the only link left —
+    // and `SessionManager.list` is what finds it.
+    const { tools } = boot();
+    finishedRun(fakeSession());
+    const id = await spawnBackground(tools, { name: "auth-audit" });
+    await flush();
+    const sessionDir = join(
+      process.env.PI_CODING_AGENT_DIR!,
+      "sessions",
+      // pi's own encoding: `C:\a\b` → `--C--a-b--`. Written out with split/join
+      // rather than a regex class so no backslash can be lost in an edit.
+      `--${process.cwd().split(/[/\\:]/).join("-")}--`,
+    );
+    mkdirSync(sessionDir, { recursive: true });
+    writeSessionFile(join(sessionDir, "sub.jsonl"), id, ["general-purpose", "general-purpose", "auth-audit", id.slice(0, 8)]);
+    await reap(id);
+    expect(existsSync(join(sessionDir, "sub.jsonl"))).toBe(true);
+
+    vi.mocked(runAgent).mockClear();
+    const result = await resume(tools, "auth-audit");
+    await flush();
+
+    expect(textOf(result)).toContain("resumed from disk in background");
+    const resumeOpts = vi.mocked(runAgent).mock.calls[0][3] as any;
+    expect(resumeOpts.resumeSessionFile).toBe(join(sessionDir, "sub.jsonl"));
+  });
+
+  it("keeps a fresh process's resume working from the transcript alone", async () => {
+    // A restart has no records at all — this is the "new pi process opens a
+    // week-old conversation" case, answered entirely from the transcript root.
+    const { tools, lifecycle } = boot();
+    finishedRun(fakeSession());
+    const id = await spawnBackground(tools);
+    await flush();
+    await reap(id);
+    // Simulate the process boundary: nothing in memory, then a new boot would
+    // construct a fresh manager. The lookup below is what that manager does.
+    delete (globalThis as any)[Symbol.for("pi-subagents:manager")];
+    await lifecycle.get("session_shutdown")?.({}, ctx());
+
+    vi.mocked(runAgent).mockClear();
+    const result = await resume(tools, id);
+    await flush();
+
+    expect(textOf(result)).toContain("resumed from disk in background");
+    const resumeOpts = vi.mocked(runAgent).mock.calls[0][3] as any;
+    expect(resumeOpts.resumeSessionFile.endsWith(`recovered-${id}.jsonl`)).toBe(true);
   });
 });
 
@@ -222,15 +304,12 @@ describe("scanArchiveSessions (fork-side archive fallback)", () => {
   it("matches session_info names only in the full pass", async () => {
     const dir = mkdtempSync(join(tmpdir(), "pi-scan-"));
     try {
-      const id = "22222222-2222-3333-4444-555555555555";
-      writeArchive(dir, "2026-01-02_def.jsonl", [header(id), info("executor#deadbeef"), msg()]);
-      // Header-only pass: name matching is impossible, id matching still works.
-      expect(scanArchiveSessions(dir, match(undefined, "executor#deadbeef"), false)).toHaveLength(0);
-      expect(scanArchiveSessions(dir, match(id), false)).toHaveLength(1);
-      // Full pass: the name resolves.
-      const hits = scanArchiveSessions(dir, match(undefined, "executor#deadbeef"), true);
-      expect(hits).toHaveLength(1);
-      expect(hits[0].name).toBe("executor#deadbeef");
+      writeArchive(dir, "2026-01-01_abc.jsonl", [header("11111111-2222-3333-4444-555555555555"), info("Explore#abc"), msg()]);
+
+      // Cheap pass reads the header only, so a name query misses.
+      expect(scanArchiveSessions(dir, match(undefined, "Explore#abc"), false)).toHaveLength(0);
+      // Full pass reads session_info lines, so it hits.
+      expect(scanArchiveSessions(dir, match(undefined, "Explore#abc"), true)).toHaveLength(1);
     } finally {
       hermeticDirCleanup(dir);
     }
@@ -239,10 +318,10 @@ describe("scanArchiveSessions (fork-side archive fallback)", () => {
   it("ignores non-jsonl files and a missing archive dir", async () => {
     const dir = mkdtempSync(join(tmpdir(), "pi-scan-"));
     try {
-      writeArchive(dir, "notes.txt", [header("33333333-2222-3333-4444-555555555555")]);
-      expect(scanArchiveSessions(dir, match("33333333-2222-3333-4444-555555555555"), true)).toHaveLength(0);
-      const missing = join(tmpdir(), "pi-scan-does-not-exist-xyz");
-      expect(scanArchiveSessions(missing, match("x"), true)).toEqual([]);
+      expect(scanArchiveSessions(dir, match("11111111-2222-3333-4444-555555555555"), false)).toHaveLength(0);
+      mkdirSync(join(dir, "archive"), { recursive: true });
+      writeFileSync(join(dir, "archive", "notes.txt"), "hello");
+      expect(scanArchiveSessions(dir, match("11111111-2222-3333-4444-555555555555"), false)).toHaveLength(0);
     } finally {
       hermeticDirCleanup(dir);
     }
@@ -251,15 +330,15 @@ describe("scanArchiveSessions (fork-side archive fallback)", () => {
   it("skips files whose header does not parse", async () => {
     const dir = mkdtempSync(join(tmpdir(), "pi-scan-"));
     try {
-      writeArchive(dir, "broken.jsonl", ["{{{not json", msg()]);
-      expect(scanArchiveSessions(dir, match("anything"), true)).toHaveLength(0);
+      writeArchive(dir, "2026-01-01_abc.jsonl", ["not json {{{", msg()]);
+      expect(scanArchiveSessions(dir, match("11111111-2222-3333-4444-555555555555"), true)).toHaveLength(0);
     } finally {
       hermeticDirCleanup(dir);
     }
   });
 });
 
-function hermeticDirCleanup(dir: string) {
-  // Local temp dirs only — never touch the hermetic agent dir owned by boot().
+/** rmSync on a directory this test created itself. */
+function hermeticDirCleanup(dir: string): void {
   rmSync(dir, { recursive: true, force: true });
 }

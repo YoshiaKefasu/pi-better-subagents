@@ -57,26 +57,26 @@ describe("AgentManager — reclaim.id による ID 再利用", () => {
     return manager.getRecord(id)!;
   }
 
-  it("tombstone resume: reclaim.id で同一 ID が復活する", async () => {
+  it("disk reopen: reclaim.id で同一 ID が復活する", async () => {
     const first = await settled("first", { name: "auth-audit" });
     const oldId = first.id;
     const oldStartedAt = first.startedAt;
     expect(first.status).toBe("completed");
 
-    // GC 相当: clearCompleted でレコードを tombstone 化する。
+    // GC / セッション境界相当: clearCompleted でレコードを落とす。会話は Disk に
+    // 残るので、reopen 側が handle/alias/id を reclaim して同一性を保つ。
     manager!.clearCompleted();
     expect(manager!.getRecord(oldId)).toBeUndefined();
-    const tomb = manager!.listTombstones().find((t) => t.id === oldId);
-    expect(tomb).toBeDefined();
-    expect(tomb!.handle).toBe(first.handle);
+    // reopen 元として覚えているのは Disk のセッションファイルだけ。
+    const sessionFile = first.sessionFile ?? "/tmp/never-used.jsonl";
 
-    // resume 経路相当: tombstone の handle/alias/id を reclaim して spawn。
+    // resume 経路相当: 落としたレコードの handle/alias/id を reclaim して spawn。
     resolvedRun();
     const resumedId = manager!.spawn(mockPi, mockCtx, "general-purpose", "follow-up", {
       description: "follow-up",
       isBackground: true,
-      reclaim: { handle: tomb!.handle, alias: tomb!.alias, id: tomb!.id },
-      resumeSessionFile: tomb!.sessionFile ?? "/tmp/never-used.jsonl",
+      reclaim: { handle: first.handle, alias: first.alias, id: oldId },
+      resumeSessionFile: sessionFile,
     } as any);
     await manager!.awaitStartup(resumedId);
     await manager!.getRecord(resumedId)!.promise;

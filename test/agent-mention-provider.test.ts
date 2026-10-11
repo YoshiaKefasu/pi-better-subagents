@@ -13,7 +13,7 @@
 import { CombinedAutocompleteProvider } from "@earendil-works/pi-tui";
 import { describe, expect, it, vi } from "vitest";
 import type { AgentManager } from "../src/agent-manager.js";
-import type { AgentRecord, AgentTombstone } from "../src/types.js";
+import type { AgentRecord } from "../src/types.js";
 import { createMentionProvider, mentionRoster } from "../src/ui/agent-mention.js";
 
 const FILE_SUGGESTIONS = { items: [{ value: "@src/index.ts", label: "src/index.ts" }], prefix: "@src/" };
@@ -46,28 +46,7 @@ function managerWith(...records: AgentRecord[]): AgentManager {
   // listAgents() is newest-first, matching the real manager's contract.
   return {
     listAgents: () => [...records].sort((a, b) => b.startedAt - a.startedAt),
-    listTombstones: () => [],
   } as unknown as AgentManager;
-}
-
-/** A manager holding only evicted agents, to exercise the resume rows. */
-function managerWithTombstones(...entries: AgentTombstone[]): AgentManager {
-  return {
-    listAgents: () => [],
-    listTombstones: () => [...entries].sort((a, b) => b.completedAt - a.completedAt),
-  } as unknown as AgentManager;
-}
-
-function tombstone(over: Partial<AgentTombstone> = {}): AgentTombstone {
-  return {
-    handle: "explore",
-    id: "t1",
-    type: "Explore" as AgentTombstone["type"],
-    description: "audit the RPC path",
-    sessionFile: "/sessions/explore.jsonl",
-    completedAt: 5000,
-    ...over,
-  };
 }
 
 /** Ask for suggestions on a single line, cursor at the end. */
@@ -525,48 +504,54 @@ describe("named agents and evicted ones", () => {
     expect(roster.map(t => t.handle)).toEqual(["auth-audit"]);
   });
 
-  it("offers an evicted agent as a resume, after the live ones", async () => {
+  it("offers a finished agent as a resume, after the live ones", async () => {
     const provider = createMentionProvider(
       builtIn(),
-      () => mentionRoster(managerWithTombstones(tombstone()), []),
+      () => mentionRoster(
+        managerWith(record({ handle: "explore", type: "Explore", status: "completed", description: "audit the RPC path" })),
+        [],
+      ),
       () => true,
     );
 
     expect(agentRows(await suggest(provider, "@"))).toEqual([
-      { value: "@explore", label: "@explore", description: "resume · Explore · audit the RPC path" },
+      { value: "@explore", label: "@explore", description: "resume · completed · audit the RPC path" },
     ]);
   });
 
   it("puts live agents ahead of resumable ones", async () => {
     // A running agent is the likelier target, and a resume is the slower,
     // more surprising action to land on by pressing Enter too quickly.
-    const manager = {
-      listAgents: () => [record({ handle: "plan", type: "Plan", status: "running" })],
-      listTombstones: () => [tombstone()],
-    } as unknown as AgentManager;
+    const manager = managerWith(
+      record({ handle: "plan", type: "Plan", status: "running", startedAt: 2000 }),
+      record({ handle: "explore", type: "Explore", status: "completed", startedAt: 1000 }),
+    );
     const provider = createMentionProvider(builtIn(), () => mentionRoster(manager, []), () => true);
 
     expect(agentRows(await suggest(provider, "@")).map(i => i.value)).toEqual(["@plan", "@explore"]);
   });
 
-  it("keeps an aliased tombstone's type handle reserved too", () => {
+  it("keeps a finished agent's type handle reserved too", () => {
     // It lists under its alias, but `@explore` still resumes it — so the
     // Explore type must not also be offered as startable under that name.
     const roster = mentionRoster(
-      managerWithTombstones(tombstone({ handle: "explore", alias: "auth-audit" })),
+      managerWith(record({ handle: "explore", alias: "auth-audit", type: "Explore", status: "completed" })),
       [{ name: "Explore", description: "search" }],
     );
 
     expect(roster.map(t => t.handle)).toEqual(["auth-audit"]);
   });
 
-  it("does not offer a startable type whose handle a tombstone still holds", () => {
-    // `@explore` resumes the old conversation, so advertising "start agent"
+  it("does not offer a startable type whose handle a finished agent still holds", () => {
+    // `@explore` resumes the finished conversation, so advertising "start agent"
     // under the same name would promise the wrong action.
-    const roster = mentionRoster(managerWithTombstones(tombstone()), [{ name: "Explore", description: "search" }]);
+    const roster = mentionRoster(
+      managerWith(record({ handle: "explore", type: "Explore", status: "completed" })),
+      [{ name: "Explore", description: "search" }],
+    );
 
     expect(roster).toHaveLength(1);
-    expect(roster[0].kind).toBe("tombstone");
+    expect(roster[0].kind).toBe("record");
   });
 });
 
@@ -594,12 +579,16 @@ describe("rows carry the display name, not the raw type", () => {
   it("names a resumable agent by its label", async () => {
     const provider = createMentionProvider(
       builtIn(),
-      () => mentionRoster(managerWithTombstones(tombstone()), [], label),
+      () => mentionRoster(
+        managerWith(record({ handle: "explore", alias: "auth-audit", type: "Explore", status: "completed", description: "audit the RPC path" })),
+        [],
+        label,
+      ),
       () => true,
     );
 
     expect((await suggest(provider, "@"))!.items[0].description)
-      .toBe("resume · Auth Auditor · audit the RPC path");
+      .toBe("resume · Auth Auditor · completed · audit the RPC path");
   });
 
   it("falls back to the raw type when no resolver is supplied", async () => {
@@ -607,7 +596,10 @@ describe("rows carry the display name, not the raw type", () => {
     // the default keeps a caller without a registry honest rather than blank.
     const provider = createMentionProvider(
       builtIn(),
-      () => mentionRoster(managerWithTombstones(tombstone()), []),
+      () => mentionRoster(
+        managerWith(record({ handle: "explore", alias: "auth-audit", type: "Explore", status: "completed", description: "audit the RPC path" })),
+        [],
+      ),
       () => true,
     );
 

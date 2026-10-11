@@ -217,6 +217,8 @@ describe("subagent_todo — tool behavior", () => {
 const mockPi = {} as any;
 const mockCtx = { cwd: "/tmp" } as any;
 const TEN_MINUTES = 10 * 60_000;
+/** agent-manager のレコード保持期間。GC はこの後に初めてレコードを落とす。 */
+const RECORD_RETAIN_MS = 24 * 60 * 60_000;
 
 describe("subagent_todo — lifecycle with AgentManager", () => {
   let manager: AgentManager | undefined;
@@ -285,14 +287,21 @@ describe("subagent_todo — lifecycle with AgentManager", () => {
     await execOn(id, { op: "set", todos: [{ content: "消える仕事" }] });
     expect(peekNestedTodos(id)).toHaveLength(1);
 
+    // 保持期間は 24 時間。10 分では live session が解放されるだけでレコードは
+    // 残るので、ToDo もまだ生きている。
     manager!.getRecord(id)!.completedAt = Date.now() - (TEN_MINUTES + 30_000);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(manager!.getRecord(id)).toBeDefined();
+    expect(peekNestedTodos(id)).toHaveLength(1);
+
+    manager!.getRecord(id)!.completedAt = Date.now() - (RECORD_RETAIN_MS + 30_000);
     await vi.advanceTimersByTimeAsync(60_000);
 
     expect(manager!.getRecord(id)).toBeUndefined();
     expect(peekNestedTodos(id)).toEqual([]);
   });
 
-  it("clearCompleted は tombstone 連動で破棄し、生き残りには触らない", async () => {
+  it("clearCompleted はレコードと共に ToDo を破棄し、生き残りには触らない", async () => {
     vi.mocked(runAgent).mockResolvedValue({
       responseText: "done",
       session: { dispose: vi.fn() } as any,
@@ -300,7 +309,7 @@ describe("subagent_todo — lifecycle with AgentManager", () => {
       steered: false,
     } as any);
     manager = new AgentManager();
-    // 終了済みトップレベル: handle + sessionFile があるので tombstone 化される。
+    // 終了済みトップレベル: handle を持つので handle キーで ToDo が載る。
     const topId = manager.spawn(mockPi, mockCtx, "X", "top", { description: "top", isBackground: true });
     await manager.getRecord(topId)!.promise;
     const top = manager.getRecord(topId)!;
@@ -322,21 +331,14 @@ describe("subagent_todo — lifecycle with AgentManager", () => {
 
     manager.clearCompleted();
 
-    // セッション境界では tombstone を保持する（完了エージェントの復活手段を
-    // 消さない）: 消えるのは live レコードのみで、tombstone とそれに紐づく
-    // ToDo は残る。生き残り（実行中）の ToDo には触らない。
-    expect(manager.listTombstones()).toHaveLength(1);
-    expect(peekNestedTodos(handle)).toHaveLength(1);
-    expect(peekNestedTodos(liveId)).toHaveLength(1);
-
-    // 明示の削除では tombstone 連動で ToDo も消える。
-    manager.clearTombstones();
-    expect(manager.listTombstones()).toEqual([]);
+    // セッション境界ではレコードごと ToDo も落ちる（会話は Disk に残るので
+    // 復活手段は失われない）。生き残り（実行中）の ToDo には触らない。
+    expect(manager.getRecord(topId)).toBeUndefined();
     expect(peekNestedTodos(handle)).toEqual([]);
     expect(peekNestedTodos(liveId)).toHaveLength(1);
   });
 
-  it("dropTombstone は対応する ToDo を破棄する", async () => {
+  it("レコードの破棄は対応する ToDo も破棄する", async () => {
     manager = new AgentManager();
     const fake = makeFakeManager();
     fake.records.set("gone-id", { id: "gone-id", handle: "gone", status: "stopped" });
@@ -345,7 +347,9 @@ describe("subagent_todo — lifecycle with AgentManager", () => {
     await tool.execute("call-1", { op: "set", todos: [{ content: "x" }] } as never, undefined, undefined, {} as never);
     expect(peekNestedTodos("gone")).toHaveLength(1);
 
-    manager.dropTombstone("gone");
+    // レコードが消える経路（GC / clearCompleted）は removeRecord 経由で
+    // dropNestedTodos を呼ぶ。ここではその公開ヘルパーを直接撃って確認する。
+    dropNestedTodos("gone");
     expect(peekNestedTodos("gone")).toEqual([]);
   });
 });

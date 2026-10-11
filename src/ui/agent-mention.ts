@@ -45,7 +45,7 @@
 import type { AutocompleteItem, AutocompleteProvider, AutocompleteSuggestions } from "@earendil-works/pi-tui";
 import type { AgentManager } from "../agent-manager.js";
 import { handleBase, MENTION_TRIGGER } from "../mention.js";
-import type { AgentRecord, AgentTombstone } from "../types.js";
+import type { AgentRecord } from "../types.js";
 
 /**
  * One thing `@` can address, and what sending to it will do. `typeLabel` is the
@@ -55,7 +55,6 @@ import type { AgentRecord, AgentTombstone } from "../types.js";
  */
 export type MentionTarget =
   | { kind: "record"; handle: string; record: AgentRecord; typeLabel: string }
-  | { kind: "tombstone"; handle: string; entry: AgentTombstone; typeLabel: string }
   | { kind: "type"; handle: string; type: string; description: string };
 
 /** The registry facts the roster needs, so it stays independent of agent-types. */
@@ -93,18 +92,10 @@ export function mentionRoster(
     targets.push({ kind: "record", handle, record, typeLabel: displayNameOf(record.type) });
   }
 
-  // Then agents that are gone but whose conversation can be reopened. After the
-  // live ones: a running agent is the likelier target, and this keeps the
-  // ordering "what exists now, then what can be brought back, then what can be
-  // started".
-  for (const entry of manager.listTombstones()) {
-    const handle = entry.alias ?? entry.handle;
-    if (taken.has(handle.toLowerCase())) continue;
-    taken.add(handle.toLowerCase());
-    taken.add(entry.handle.toLowerCase());
-    targets.push({ kind: "tombstone", handle, entry, typeLabel: displayNameOf(entry.type) });
-  }
-
+  // Then agent types with nothing live to address. A finished agent's row
+  // disappears with its record, but the conversation is still on disk and
+  // `Agent({ resume })` reopens it by id — the popup lists what `@` can reach
+  // right now, not what is archived.
   for (const type of types) {
     const handle = handleBase(type.name);
     if (taken.has(handle)) continue;
@@ -195,11 +186,6 @@ function mentionItems(roster: MentionTarget[], line: string, cursorCol: number):
 /** Name the action that will actually happen, so the list never mispromises. */
 function describeTarget(target: MentionTarget): string {
   if (target.kind === "type") return `start agent · ${summarize(target.description)}`;
-  if (target.kind === "tombstone") {
-    // No status: the record is gone, and "completed" would imply one is still
-    // being tracked. The type carries the identity the handle may not.
-    return `resume · ${target.typeLabel} · ${target.entry.description}`;
-  }
   const { status, description, alias } = target.record;
   const action = status === "running" || status === "queued" ? "send message" : "resume";
   // A row listed under its alias has lost the type its handle would have shown,

@@ -449,8 +449,22 @@ export interface ToolActivity {
 export interface RunOptions {
   /** ExtensionAPI instance — used for pi.exec() instead of execSync. */
   pi: ExtensionAPI;
-  /** Manager-assigned id; suffixes session name to disambiguate parallel spawns (e.g. `Explore#a1b2c3d4`). */
+  /**
+   * Manager-assigned id; suffixes session name to disambiguate parallel spawns (e.g. `Explore#a1b2c3d4`).
+   *
+   * The session name is the ONLY on-disk record of who this conversation
+   * belongs to — the pi session id is pi's own, and nothing else links a
+   * `.jsonl` back to an agent. It is written as
+   * `<type>#<handle>#<alias>#<id8>`, keeping only the parts that exist, so
+   * `Agent({ resume })` and `findSessionOnDisk` can reach a finished agent by
+   * handle, alias or id from the file alone, once its in-memory record is
+   * gone.
+   */
   agentId?: string;
+  /** Top-level handle this agent was allocated (`@explore`), if any. */
+  handle?: string;
+  /** Second handle from the spawner's `name` (`@auth-audit`), if any. */
+  alias?: string;
   model?: Model<any>;
   /**
    * モデルフォールバック連鎖の残り（先頭を除く生文字列）。先頭は `model`
@@ -1122,9 +1136,14 @@ export async function runAgent(
   const { session } = await runInChildSessionContext(() => createAgentSession(sessionOpts));
 
   const baseSessionName = agentConfig?.name ?? type;
-  session.setSessionName(
-    options.agentId ? `${baseSessionName}#${options.agentId.slice(0, 8)}` : baseSessionName,
-  );
+  // The identity a resume needs once the record is gone: type first (it is what
+  // the reader recognizes), then the names someone could type, then the short id
+  // from a completion notification. `findSessionOnDisk` matches any `#` token.
+  const nameTokens = [baseSessionName];
+  if (options.handle) nameTokens.push(options.handle);
+  if (options.alias) nameTokens.push(options.alias);
+  if (options.agentId) nameTokens.push(options.agentId.slice(0, 8));
+  session.setSessionName(nameTokens.join("#"));
 
   // Bind extensions so that session_start fires and extensions can initialize
   // (e.g. loading credentials, setting up state). Tool gating already happened

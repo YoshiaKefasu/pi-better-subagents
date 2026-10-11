@@ -1,8 +1,8 @@
-// The 10-minute record GC (AgentManager.cleanup) has never run in a test: the
-// main agent-manager suite uses real timers throughout, and nothing calls the
-// private method. Its two guards are load-bearing in opposite directions —
-// inverting the cutoff disposes results the LLM hasn't read yet, and dropping
-// the running/queued skip disposes a LIVE agent's session mid-run.
+// The record reaper (AgentManager.cleanup) has never run in a test: the main
+// agent-manager suite uses real timers throughout, and nothing calls the
+// private method. Its two stages are load-bearing in opposite directions —
+// inverting the retention cutoff reaps records the LLM hasn't read yet, and
+// dropping the running/queued skip disposes a LIVE agent's session mid-run.
 //
 // It lives in its own file because vi.useFakeTimers() has to be installed
 // BEFORE `new AgentManager()` (the constructor starts the interval), and fake
@@ -28,6 +28,8 @@ const mockPi = {} as any;
 const mockCtx = { cwd: "/tmp" } as any;
 
 const TEN_MINUTES = 10 * 60_000;
+/** How long a finished record is kept in memory before the GC reaps it. */
+const RECORD_RETAIN_MS = 24 * 60 * 60_000;
 const TICK = 60_000;
 
 describe("AgentManager — record GC", () => {
@@ -69,7 +71,10 @@ describe("AgentManager — record GC", () => {
     expect(manager.getRecord(id)).toBeDefined();
   });
 
-  it("evicts a record that completed before the cutoff and disposes its session", async () => {
+  it("releases a 10-minute-old record's session but keeps the record", async () => {
+    // The first stage of the sweep: the expensive half goes, the bookkeeping
+    // stays — and with it the handle, the counts and the two file paths a
+    // resume needs.
     manager = new AgentManager();
     const { id, record } = await settled("stale");
     const dispose = vi.fn();
@@ -78,12 +83,26 @@ describe("AgentManager — record GC", () => {
 
     await vi.advanceTimersByTimeAsync(TICK);
 
+    expect(manager.getRecord(id)).toBeDefined();
+    expect(record.session).toBeUndefined();
+    expect(dispose).toHaveBeenCalled();
+  });
+
+  it("evicts a record that outlived the 24-hour window and disposes its session", async () => {
+    manager = new AgentManager();
+    const { id, record } = await settled("stale");
+    const dispose = vi.fn();
+    record.session = { dispose } as any;
+    record.completedAt = Date.now() - (RECORD_RETAIN_MS + 30_000);
+
+    await vi.advanceTimersByTimeAsync(TICK);
+
     expect(manager.getRecord(id)).toBeUndefined();
     expect(manager.listAgents().map(a => a.id)).not.toContain(id);
     expect(dispose).toHaveBeenCalled();
   });
 
-  it("closes the evicted session's extension lifecycle before disposing it (#242)", async () => {
+  it("closes the released session's extension lifecycle before disposing it (#242)", async () => {
     // The reported crash, on its own path: this sweep is what fires ~10 min after a
     // subagent finishes. Disposing only invalidates the ExtensionRunner, so whatever
     // an extension armed in `session_start` stayed armed — and its next tick threw
@@ -100,7 +119,7 @@ describe("AgentManager — record GC", () => {
 
     await vi.advanceTimersByTimeAsync(TICK);
 
-    expect(manager.getRecord(id)).toBeUndefined();
+    expect(manager.getRecord(id)).toBeDefined();
     expect(emit).toHaveBeenCalledWith({ type: "session_shutdown", reason: "quit" });
     // After dispose() the runner is invalidated and every ctx getter throws, so an
     // emit that landed afterwards would be worse than none.
@@ -140,11 +159,11 @@ describe("AgentManager — record GC", () => {
   });
 
   it("sweeps repeatedly, not just once", async () => {
-    // The interval must keep firing: a record that ages past the cutoff on a
-    // later tick has to be collected too.
+    // The interval must keep firing: a record that ages past the retention
+    // window on a later tick has to be collected too.
     manager = new AgentManager();
     const { id, record } = await settled("ages-out");
-    record.completedAt = Date.now() - (TEN_MINUTES - 3 * TICK);
+    record.completedAt = Date.now() - (RECORD_RETAIN_MS - 3 * TICK);
 
     await vi.advanceTimersByTimeAsync(TICK);
     expect(manager.getRecord(id)).toBeDefined(); // still inside the window
@@ -157,7 +176,7 @@ describe("AgentManager — record GC", () => {
 // Eviction is exactly the moment a handle would otherwise stop working. These
 // cover what outlives it: enough to find the agent's session on disk and
 // reopen the conversation, and the name held so nothing else claims it.
-describe("AgentManager — tombstones outliving the GC", () => {
+describe("AgentManager — records outliving the GC", () => {
   let manager: AgentManager;
 
   beforeEach(() => vi.useFakeTimers());
@@ -166,8 +185,8 @@ describe("AgentManager — tombstones outliving the GC", () => {
     vi.useRealTimers();
   });
 
-  /** Spawn, settle, and age past the cutoff so the next tick evicts it. */
-  async function evictable(type: string, prompt: string, sessionFile?: string) {
+  /** Spawn, settle, and age to `minutes` past completion. */
+  async function aged(type: string, prompt: string, minutes: number, sessionFile?: string) {
     vi.mocked(runAgent).mockResolvedValue({
       responseText: "done",
       session: { dispose: vi.fn() } as any,
@@ -179,57 +198,86 @@ describe("AgentManager — tombstones outliving the GC", () => {
     const record = manager.getRecord(id)!;
     await record.promise;
     record.sessionFile = sessionFile;
-    record.completedAt = Date.now() - (TEN_MINUTES + 30_000);
+    record.completedAt = Date.now() - minutes * 60_000;
     return { id, record };
   }
 
-  it("keeps an evicted agent reachable by name when its session is on disk", async () => {
-    manager = new AgentManager();
-    await evictable("Explore", "audit the RPC path", "/sessions/explore.jsonl");
+  /** One sweep of the 60s cleanup timer. */
+  const tick = () => vi.advanceTimersByTimeAsync(TICK);
 
-    await vi.advanceTimersByTimeAsync(TICK);
+  it("keeps a finished agent reachable by name while its record lives", async () => {
+    // Only the live session is released at 10 minutes; the record (and with it
+    // the handle) stays for 24 hours, so `@explore` still addresses it.
+    manager = new AgentManager();
+    await aged("Explore", "audit the RPC path", TEN_MINUTES / 60_000 + 0.5, "/sessions/explore.jsonl");
+
+    await tick();
 
     const resolved = manager.resolveMention("explore");
-    expect(resolved?.kind).toBe("tombstone");
+    expect(resolved?.kind).toBe("live");
     expect(resolved).toMatchObject({
-      entry: { handle: "explore", type: "Explore", description: "audit the RPC path", sessionFile: "/sessions/explore.jsonl" },
+      record: { handle: "explore", type: "Explore", description: "audit the RPC path", sessionFile: "/sessions/explore.jsonl" },
     });
   });
 
-  it("still tombstones a record whose session was only ever in memory (name held, not resumable)", async () => {
-    // Without a file there is no conversation to reopen — but the tombstone is
-    // still kept so the finished agent is never silently discarded: the name
-    // stays held against shadowing and the entry stays visible (and on disk).
-    // Only the reopen is impossible, which the resume paths enforce by
-    // requiring a session file.
+  it("still keeps a record whose session was only ever in memory", async () => {
+    // In-memory sessions leave no file, so there is no conversation to reopen —
+    // but the record is kept for the full window either way: it is what holds
+    // the name and answers the widget, and the sweep treats both alike.
     manager = new AgentManager();
-    await evictable("Explore", "ephemeral", undefined);
+    await aged("Explore", "ephemeral", TEN_MINUTES / 60_000 + 0.5);
 
-    await vi.advanceTimersByTimeAsync(TICK);
+    await tick();
 
     const resolved = manager.resolveMention("explore");
-    expect(resolved?.kind).toBe("tombstone");
-    expect(manager.listTombstones()).toHaveLength(1);
-    expect(manager.listTombstones()[0].sessionFile).toBeUndefined();
+    expect(resolved?.kind).toBe("live");
+    expect(manager.listAgents()).toHaveLength(1);
+    expect(manager.listAgents()[0].sessionFile).toBeUndefined();
   });
 
-  it("holds the evicted handle so a later agent of the same type can't shadow it", async () => {
+  it("holds the finished handle so a later agent of the same type can't shadow it", async () => {
     manager = new AgentManager();
-    await evictable("Explore", "first", "/sessions/first.jsonl");
-    await vi.advanceTimersByTimeAsync(TICK);
+    await aged("Explore", "first", TEN_MINUTES / 60_000 + 0.5, "/sessions/first.jsonl");
+    await tick();
+    expect(manager.resolveMention("explore")?.kind).toBe("live");
 
+    vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}));
     const id = manager.spawn(mockPi, mockCtx, "Explore", "second", { description: "second", isBackground: true });
 
     expect(manager.getRecord(id)!.handle).toBe("explore-2");
     // ...and `@explore` still means the conversation you can resume.
-    expect(manager.resolveMention("explore")?.kind).toBe("tombstone");
+    expect(manager.resolveMention("explore")?.kind).toBe("live");
   });
 
-  it("prefers a live agent over a tombstone holding the same name", async () => {
+  it("frees the name once the record is reaped, without losing the conversation", async () => {
+    // The conversation is a file, not a record: once the 24h window is over the
+    // name goes back to the type and a resume by id reopens the file.
     manager = new AgentManager();
-    await evictable("Explore", "old", "/sessions/old.jsonl");
-    await vi.advanceTimersByTimeAsync(TICK);
-    // Give the live agent the tombstone's name directly: the collision this
+    await aged("Explore", "first", RECORD_RETAIN_MS / 60_000 + 0.5, "/sessions/first.jsonl");
+
+    await tick();
+
+    expect(manager.resolveMention("explore")).toBeUndefined();
+    vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}));
+    const id = manager.spawn(mockPi, mockCtx, "Explore", "second", { description: "second", isBackground: true });
+    expect(manager.getRecord(id)!.handle).toBe("explore");
+  });
+
+  it("keeps a record alive while the process is only part-way through the window", async () => {
+    manager = new AgentManager();
+    const { id } = await aged("Explore", "half-way", RECORD_RETAIN_MS / 60_000 - 1, "/sessions/half.jsonl");
+
+    await tick();
+
+    expect(manager.getRecord(id)).toBeDefined();
+    expect(manager.resolveMention("explore")?.kind).toBe("live");
+  });
+
+  it("prefers a live agent over a finished record holding the same name", async () => {
+    manager = new AgentManager();
+    await aged("Explore", "old", TEN_MINUTES / 60_000 + 0.5, "/sessions/old.jsonl");
+    await tick();
+    // Give the live agent the finished record's name directly: the collision this
     // guards against is resolution order, not allocation.
     vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}));
     const id = manager.spawn(mockPi, mockCtx, "Explore", "live", { description: "live", isBackground: true });
@@ -240,91 +288,29 @@ describe("AgentManager — tombstones outliving the GC", () => {
     expect(resolved).toMatchObject({ record: { id } });
   });
 
-  it("drops the oldest once the cap is reached, keeping the most recent", async () => {
+  it("reaps a later stale record on the next sweep, not just the first", async () => {
+    // The timer fires every minute; each pass must be able to reap whatever has
+    // aged past the window since the last one.
     manager = new AgentManager();
-    for (let i = 0; i < 1001; i++) {
-      const { record } = await evictable("Explore", `run-${i}`, `/sessions/${i}.jsonl`);
-      // Distinct ages so "oldest" is well defined; run-0 is the oldest. Set on
-      // the record we just made — under fake timers every startedAt is equal,
-      // so listAgents() has no meaningful order to index into.
-      record.completedAt = Date.now() - (TEN_MINUTES + 1001_000 - i * 1000);
-    }
-    await vi.advanceTimersByTimeAsync(TICK);
+    const stale = await aged("Explore", "stale-1", RECORD_RETAIN_MS / 60_000 + 0.5);
+    await tick();
+    expect(manager.getRecord(stale.id)).toBeUndefined();
 
-    expect(manager.listTombstones()).toHaveLength(1000);
-    expect(manager.resolveMention("explore")).toBeUndefined(); // run-0's handle
-    expect(manager.resolveMention("explore-1001")?.kind).toBe("tombstone");
+    const stale2 = await aged("Explore", "stale-2", RECORD_RETAIN_MS / 60_000 + 0.5);
+    await tick();
+    expect(manager.getRecord(stale2.id)).toBeUndefined();
   });
 
-  it("hands a reclaimed name straight back, numbering nothing", async () => {
-    // The resume path's whole contract: `handleBase(type)` cannot reproduce a
-    // numbered handle, so the spawn takes the tombstone's names verbatim.
+  it("never reaps a record before its retention window, however it is addressed", async () => {
+    // A 24h-old-looking record that is still inside the window is untouched, and
+    // the id-prefix resolution that a short id from a notification uses still
+    // answers.
     manager = new AgentManager();
-    await evictable("Explore", "first", "/sessions/first.jsonl");
-    manager.spawn(mockPi, mockCtx, "Explore", "second", { description: "second", isBackground: true });
-    await vi.advanceTimersByTimeAsync(TICK);
+    const { id } = await aged("Explore", "resolvable", RECORD_RETAIN_MS / 60_000 - 1, "/sessions/x.jsonl");
 
-    vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}));
-    const id = manager.spawn(mockPi, mockCtx, "Explore", "resumed", {
-      description: "first",
-      isBackground: true,
-      reclaim: { handle: "explore", alias: "auth-audit" },
-    } as any);
+    await tick();
 
-    expect(manager.getRecord(id)).toMatchObject({ handle: "explore", alias: "auth-audit" });
-  });
-
-  it("ignores a reclaim on a nested child, which has no name to hold", async () => {
-    manager = new AgentManager();
-    vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}));
-    const id = manager.spawn(mockPi, mockCtx, "Explore", "child", {
-      description: "child",
-      parentAgentId: "parent-id",
-      reclaim: { handle: "explore", alias: "auth-audit" },
-    } as any);
-
-    expect(manager.getRecord(id)).toMatchObject({ handle: undefined, alias: undefined });
-  });
-
-  it("stops answering a name once its tombstone is dropped", async () => {
-    manager = new AgentManager();
-    await evictable("Explore", "done", "/sessions/done.jsonl");
-    await vi.advanceTimersByTimeAsync(TICK);
-    expect(manager.resolveMention("explore")?.kind).toBe("tombstone");
-
-    manager.dropTombstone("explore");
-
-    expect(manager.resolveMention("explore")).toBeUndefined();
-    expect(manager.listTombstones()).toHaveLength(0);
-  });
-
-  it("frees a dropped name for the next agent of that type", async () => {
-    // Otherwise a resumed agent's own handle stays reserved by the corpse and
-    // every later spawn climbs: explore-2, explore-3, …
-    manager = new AgentManager();
-    await evictable("Explore", "done", "/sessions/done.jsonl");
-    await vi.advanceTimersByTimeAsync(TICK);
-    manager.dropTombstone("explore");
-
-    vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}));
-    const id = manager.spawn(mockPi, mockCtx, "Explore", "next", { description: "next", isBackground: true });
-
-    expect(manager.getRecord(id)!.handle).toBe("explore");
-  });
-
-  it("keeps tombstones when the session ends (resume survives the switch)", async () => {
-    // Session boundaries evict live records into tombstones but no longer wipe
-    // them: an evicted agent stays reopenable in the next session, so `@explore`
-    // still reaches the conversation its user remembers starting. Explicit
-    // deletion is dropTombstone (single) / clearTombstones (all).
-    manager = new AgentManager();
-    await evictable("Explore", "prior session", "/sessions/prior.jsonl");
-    await vi.advanceTimersByTimeAsync(TICK);
-    expect(manager.listTombstones()).toHaveLength(1);
-
-    manager.clearCompleted(true);
-
-    expect(manager.listTombstones()).toHaveLength(1);
-    expect(manager.resolveMention("explore")?.kind).toBe("tombstone");
+    expect(manager.resolveRecord(id.slice(0, 8))?.id).toBe(id);
+    expect(manager.resolveMention(id.slice(0, 8))?.kind).toBe("live");
   });
 });

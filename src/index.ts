@@ -33,10 +33,10 @@ import { parseModelChain } from "./model-fallback-chain.js";
 import { describeModel, type ModelRegistry, resolveModel } from "./model-resolver.js";
 import { checkModelScope, isScopeModelsEnabled, setScopeModelsEnabled } from "./model-scope.js";
 import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
-import { createOutputFilePath, ensureOutputFile, getOutputTranscriptDefault, sessionTaskDir, setOutputTranscriptDefault, streamToOutputFile, writeInitialEntry } from "./output-file.js";
+import { createOutputFilePath, ensureOutputFile, findOutputFile, getOutputTranscriptDefault, materializeSessionFromOutputFile, sessionTaskDir, setOutputTranscriptDefault, streamToOutputFile, writeInitialEntry } from "./output-file.js";
 import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
-import { ARCHIVE_DIR_NAME, archiveAgeMs, archiveSessions, DEFAULT_ARCHIVE_AGE_HOURS, readArchiveConfig } from "./session-archive.js";
+import { ARCHIVE_DIR_NAME, archiveAgeMs, archiveSessions, DEFAULT_ARCHIVE_AGE_HOURS, DEFAULT_ARCHIVE_ENABLED, readArchiveConfig } from "./session-archive.js";
 import { applyAndEmitLoaded, loadSettings, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
 import { getStatusNote, partialOutputSuffix } from "./status-note.js";
 import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type JoinMode, type NotificationDetails, type ResultDisplayMode, type SubagentType, type ViewerMarkdownMode, type WidgetMode } from "./types.js";
@@ -288,8 +288,8 @@ export { FOREIGN_WORKFLOW_TOOL_NAMES, WORKFLOW_ENTRY_TYPE, type WorkflowEntryDat
  * `resumeSessionFile` so a path from outside can never name a file to open,
  * and this lookup must not become the back door. A raw `.jsonl` path is
  * therefore accepted only when it is inside this extension's own session dir
- * or one of the session files it recorded (live records + tombstones, passed
- * in via `trust`) — anything else reads as `undefined` (`Agent not found`).
+ * or one of the session files it recorded (live records, passed in via
+ * `trust`) — anything else reads as `undefined` (`Agent not found`).
  *
  * Name/id matching collects every hit and returns `undefined` when more than
  * one session answers, mirroring `resolveRecord`'s ambiguous-prefix refusal.
@@ -331,11 +331,15 @@ async function findSessionOnDisk(
       return { path: s.path!, type, name: s.name };
     }
 
-    // 2. "type#<hashPart>" format: match if query starts with hashPart, or hashPart starts with query
+    // 2. "type#token…" format: the tokens after the type carry the identity a
+    //    resume needs once the record is gone — handle, alias, short agent id.
+    //    Any of them may be typed, so any of them may match.
     if (sName.includes("#")) {
       const parts = sName.split("#");
-      const hashPart = parts[1];
-      if (hashPart && (norm.startsWith(hashPart) || (norm.length >= 4 && hashPart.startsWith(norm)))) {
+      const token = parts.slice(1).find(
+        (p) => p && (norm.startsWith(p) || (norm.length >= 4 && p.startsWith(norm))),
+      );
+      if (token !== undefined) {
         return { path: s.path!, type: parts[0], name: s.name };
       }
     }
@@ -387,6 +391,19 @@ async function findSessionOnDisk(
   if (trust?.sessionDir) {
     const archived = scanArchiveSessions(trust.sessionDir, matchSession, hits.length === 0);
     for (const hit of archived) hits.push(hit);
+  }
+
+  // Nothing in any session dir. Last source: the agent's `.output` transcript,
+  // which for a run whose session was never persisted is the only copy of the
+  // conversation left. Rebuilding one from it produces a real pi session, so it
+  // is returned exactly like a session found on disk — the caller reopens it
+  // the same way. Only on a miss: this walks the transcript root.
+  if (hits.length === 0) {
+    const transcript = findOutputFile(norm);
+    if (transcript) {
+      const recovered = materializeSessionFromOutputFile(transcript, cwd, trust?.sessionDir);
+      if (recovered) hits.push({ path: recovered, type: "general-purpose" });
+    }
   }
 
   const uniq = hits.filter((h, i) => hits.findIndex(x => x.path === h.path) === i);
@@ -453,24 +470,38 @@ export function scanArchiveSessions(
 }
 
 /**
- * tombstone のセッションファイルを実在確認付きで解決する。記録後に
- * session-archive が `<sessionDir>/archive/` へ移動していても（move のため
- * basename は不変）見つけられるよう、archive  sibling をフォールバックに探す。
- * どちらにも無ければ undefined — メンション経路・Agent resume 経路とも従来
- * 通りその tombstone を落として `Agent not found` 側に寄せる。sessionFile を
- * 持たない tombstone（in-memory セッションの GC 遺留）は構造上復活不能のため
- * 同様に undefined を返す。
+ * Where a finished agent's conversation can be reopened from. Three sources,
+ * in order of fidelity:
+ *
+ *   1. the recorded pi session file (the conversation exactly as it ran),
+ *   2. its `archive/` sibling — `session-archive` moves a stale transcript
+ *      there after 24h idle, and the move keeps the basename, so the archived
+ *      copy is the same session,
+ *   3. a pi session rebuilt from the agent's `.output` transcript, which is
+ *      what covers a run whose session was never persisted at all.
+ *
+ * `type` is only used by the third leg, to name the rebuilt session; it comes
+ * from the record, which the caller always has.
+ *
+ * Returns undefined only when none of the three exists, which is what leaves a
+ * resume with nothing to open (`Agent not found`, or a fresh start for a
+ * mention).
  */
-function resolveTombstoneSessionFile(
-  entry: { sessionFile?: string },
+function resolveSessionFileOnDisk(
+  entry: { sessionFile?: string; outputFile?: string; id?: string; type?: string },
   sessionDir?: string,
+  cwd?: string,
 ): string | undefined {
   if (entry.sessionFile && existsSync(entry.sessionFile)) return entry.sessionFile;
   if (sessionDir && entry.sessionFile) {
     const archived = join(sessionDir, ARCHIVE_DIR_NAME, basename(entry.sessionFile));
     if (existsSync(archived)) return archived;
   }
-  return undefined;
+  // The `.output` fallback needs a cwd: pi's session dir is derived from it.
+  if (!cwd) return undefined;
+  const transcript = entry.outputFile ?? (entry.id ? findOutputFile(entry.id) : undefined);
+  if (!transcript) return undefined;
+  return materializeSessionFromOutputFile(transcript, cwd, sessionDir, entry.type);
 }
 
 export default function (pi: ExtensionAPI) {
@@ -628,10 +659,10 @@ export default function (pi: ExtensionAPI) {
   /**
    * The Settings screen's view of the `session-archive` section in pi's
    * settings (`.pi/settings.json` / global, project wins). Defaults mirror
-   * session-archive.ts: off / 24h. Re-synced on every session_start because
+   * session-archive.ts: enabled / 24h. Re-synced on every session_start because
    * the values live outside this extension and may change under it.
    */
-  let archiveEnabled = false;
+  let archiveEnabled = DEFAULT_ARCHIVE_ENABLED;
   let archiveAgeHours = DEFAULT_ARCHIVE_AGE_HOURS;
   function getArchiveEnabled(): boolean { return archiveEnabled; }
   function setArchiveEnabled(enabled: boolean): void { archiveEnabled = enabled; }
@@ -767,6 +798,11 @@ export default function (pi: ExtensionAPI) {
     // notification, and UI channels.
     if (!isTopLevelAgent(record)) return;
 
+    // The run just wrote its final transcript, so this is the moment a child
+    // session file can be judged stale. Throttled: a batch of completions is
+    // one scan, not four.
+    if (currentCtx) sweepArchiveThrottled(currentCtx);
+
     // Emit lifecycle event based on terminal status
     const isError = record.status === "error" || record.status === "stopped" || record.status === "aborted";
     const eventData = buildEventData(record);
@@ -842,10 +878,11 @@ export default function (pi: ExtensionAPI) {
     if (reportUsage) pendingUsage.add(usage);
   });
 
-  // Evicted agents stay reopenable across restarts and session switches: mirror
-  // tombstones to the fork-owned store under the agent dir (best-effort; a
-  // corrupt file starts empty, a failed write never fails the session).
-  manager.enableTombstonePersistence();
+  // NOTE: nothing is mirrored to a side store. A finished agent's
+  // conversation already lives on disk — the pi session file, its `archive/`
+  // sibling after 24h idle, and the `.output` transcript — and every resume
+  // path reopens one of those. A second index of the same facts (the old
+  // tombstone store) was one more thing to keep in sync for no capability.
 
   // Expose manager via Symbol.for() global registry for cross-package access.
   // Standard Node.js pattern for cross-package singletons (used by OpenTelemetry, etc.).
@@ -925,8 +962,8 @@ export default function (pi: ExtensionAPI) {
    * Resolve a tool's `agent_id` as an id OR a handle, so the model addresses
    * agents by the same names the user types. Ids are tried first, keeping the
    * existing behaviour exact — a handle is only consulted when the string is
-   * not an id at all. Only live records: a tombstone has nothing to steer and
-   * no result to read. Callers still enforce the nested-ownership rejection.
+   * not an id at all. Only live records: a finished one has nothing to steer
+   * and no result to read. Callers still enforce the nested-ownership rejection.
    */
   const resolveAgentRef = (ref: string): AgentRecord | undefined => {
     const byId = manager.getRecord(ref);
@@ -988,17 +1025,22 @@ export default function (pi: ExtensionAPI) {
 
   /**
    * Session archive (see README → Session archive): move stale subagent
-   * session transcripts into `<sessionDir>/archive/`. Opt-in via pi settings
-   * (`session-archive.enabled`), and run from the main session only — a child
-   * session carries its parent in the header and must not sweep on its own
-   * account, or every subagent would race the same archive/ dir at spawn.
-   * Best-effort by design: anything that can fail here is a notify, never an
-   * exception, so startup cannot be taken down by housekeeping.
+   * session transcripts into `<sessionDir>/archive/`. On by default (24h idle
+   * window, `session-archive.enabled: false` to opt out), and run from the main
+   * session only — a child session carries its parent in the header and must
+   * not sweep on its own account, or every subagent would race the same
+   * archive/ dir at spawn. Best-effort by design: anything that can fail here
+   * is a notify, never an exception, so startup cannot be taken down by
+   * housekeeping.
+   *
+   * Archiving does not make a session unreachable: `findSessionOnDisk` scans
+   * `archive/` directly and `resolveSessionFileOnDisk` falls back to the
+   * archived sibling, so a resume keeps working after the move.
    */
   function archiveStaleSessions(ctx: ExtensionContext): void {
     try {
       const config = readArchiveConfig(ctx.cwd);
-      if (!config?.enabled) return;
+      if (!config.enabled) return;
       const sessionDir = ctx.sessionManager?.getSessionDir?.();
       if (!sessionDir) return;
       if (ctx.sessionManager?.getHeader?.()?.parentSession) return;  // subagent session
@@ -1017,6 +1059,45 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
+  /**
+   * Periodic sweep, so a session left open for days still archives child
+   * transcripts that cross the 24h window while it runs. Cheap: it re-reads the
+   * config and scans one directory, on a timer, never per message.
+   */
+  const ARCHIVE_SWEEP_INTERVAL_MS = 30 * 60_000;
+  /** Minimum gap between two sweeps, so a burst of completions costs one scan. */
+  const ARCHIVE_SWEEP_MIN_GAP_MS = 5 * 60_000;
+  let archiveSweepTimer: ReturnType<typeof setInterval> | undefined;
+  let lastArchiveSweepAt = 0;
+
+  function sweepArchive(ctx: ExtensionContext): void {
+    lastArchiveSweepAt = Date.now();
+    archiveStaleSessions(ctx);
+  }
+
+  /**
+   * Sweep now, unless one ran within the last few minutes. Agent completions
+   * can bunch up (a batch of four finishing together), and the 24h idle window
+   * means nothing is lost by skipping the duplicate scans.
+   */
+  function sweepArchiveThrottled(ctx: ExtensionContext): void {
+    if (Date.now() - lastArchiveSweepAt < ARCHIVE_SWEEP_MIN_GAP_MS) return;
+    sweepArchive(ctx);
+  }
+
+  function startArchiveSweep(ctx: ExtensionContext): void {
+    stopArchiveSweep();
+    // unref: a housekeeping timer must never be what keeps the process alive.
+    archiveSweepTimer = setInterval(() => sweepArchive(ctx), ARCHIVE_SWEEP_INTERVAL_MS);
+    archiveSweepTimer.unref?.();
+  }
+
+  function stopArchiveSweep(): void {
+    if (archiveSweepTimer === undefined) return;
+    clearInterval(archiveSweepTimer);
+    archiveSweepTimer = undefined;
+  }
+
   // Capture ctx from session_start for RPC spawn handler + start the scheduler.
   // This also wires the RPC handlers and broadcasts readiness — on the first
   // bound session_start, so a filtered-out activation never advertises (#142).
@@ -1031,10 +1112,13 @@ export default function (pi: ExtensionAPI) {
     // settings. archiveStaleSessions re-reads the files itself, so this only
     // drives the UI.
     const archiveCfg = readArchiveConfig(ctx.cwd);
-    archiveEnabled = archiveCfg?.enabled === true;
-    archiveAgeHours = archiveCfg?.maxAgeHours ?? DEFAULT_ARCHIVE_AGE_HOURS;
-    // Best-effort housekeeping: stale subagent transcripts move to archive/ (opt-in).
-    archiveStaleSessions(ctx);
+    archiveEnabled = archiveCfg.enabled;
+    archiveAgeHours = archiveCfg.maxAgeHours;
+    // Best-effort housekeeping: stale subagent transcripts move to archive/ (on
+    // by default). The periodic sweep covers the ones that go stale later —
+    // session_start only ever sees what was already old at launch.
+    sweepArchive(ctx);
+    startArchiveSweep(ctx);
     // Guard mirrors the `!scheduler.isActive()` pattern below: session_start
     // fires once per activation, but a double-bind must not leak listeners.
     if (!rpcHandle) {
@@ -1193,85 +1277,32 @@ export default function (pi: ExtensionAPI) {
         );
         return { action: "handled" };
       }
-      // A live record with no session never got far enough to continue, so it
-      // falls through to the start-fresh path below, like Claude's
-      // `no_transcript`.
-    }
 
-    // Evicted, but its conversation is still on disk: reopen it. This is an
-    // ordinary spawn carrying a session file, so the new record picks up the
-    // widget, fleet row, transcript and completion notification unchanged —
-    // and `reclaim` hands it back the names the tombstone was holding.
-    if (resolved?.kind === "tombstone") {
-      const entry = resolved.entry;
-      const target = `@${entry.alias ?? entry.handle}`;
-
-      // Checked here rather than left to SessionManager.open: that runs inside
-      // runAgent, whose rejection lands on the record as an agent error, not in
-      // the catch below. A `/new` in another pi window or a manual delete makes
-      // the conversation unrecoverable (Claude Code's `not_reachable`), so drop
-      // the entry — a row that can only ever fail is worse than none — and say
-      // so rather than quietly sending this message to an unrelated agent.
-      // archive 移動済みでも reopen できるよう resolveTombstoneSessionFile で探す。
-      const tombSessionFile = resolveTombstoneSessionFile(entry, ctx.sessionManager?.getSessionDir?.());
-      if (!tombSessionFile && !entry.sessionFile) {
-        // 未永続セッションの tombstone は会話の reopen 不可: 復活失敗ではなく
-        // 新規開始にフォールスルーする（live record はあるが session が無い場合と
-        // 同様 — 上の分岐を素通りしたのと同じ扱い）。名前は解放する: 持ち続けて
-        // いると新規が explore-2 になり、蘇らない corpse が名前を塞ぎ続ける。
-        manager.dropTombstone(entry.handle);
-      } else {
-        if (!tombSessionFile) {
-          manager.dropTombstone(entry.handle);
-          ctx.ui.notify(`Could not resume ${target} — its session is gone.`, "warning");
-          return { action: "handled" };
-        }
-
-      // The Agent tool deliberately falls back to general-purpose for a type it
-      // cannot resolve (#183), which covers a deleted file AND a merely
-      // disabled one. A resume must not inherit that: reopening this
-      // conversation under a different agent's prompt and tools is not
-      // continuing it, and the new record would re-tombstone under the
-      // substitute, so the handle would never find its way back.
-      reloadCustomAgents();
-      const dispatch = resolveSpawnType(entry.type);
-      if (!dispatch.ok || dispatch.fellBackFrom !== undefined) {
-        // The tombstone stays: re-enabling the agent makes the handle work
-        // again, which a drop would foreclose.
-        ctx.ui.notify(`Could not resume ${target} — the ${entry.type} agent is no longer available.`, "warning");
+      // Finished, and the 10-minute sweep already released its live session.
+      // The conversation is on disk, so reopen it rather than starting a
+      // second one from scratch: the record still names the file (and its
+      // `.output` transcript as a last resort), and `reclaim` hands back the
+      // names it is holding.
+      const diskFile = resolveSessionFileOnDisk(record, ctx.sessionManager?.getSessionDir?.(), ctx.cwd);
+      if (diskFile) {
+        const failure = await reopenFromDisk(ctx, record, diskFile, mention.message);
+        ctx.ui.notify(
+          failure ? `Could not resume ${target} — ${failure}` : `Resuming ${target}`,
+          failure ? "warning" : "info",
+        );
         return { action: "handled" };
       }
-
-      try {
-        // spawnResolved, not spawnTopLevel: the latter strips
-        // `resumeSessionFile` and `reclaim` as untrusted. This path is the
-        // exception — both come from a tombstone this extension wrote.
-        const id = spawnResolved(pi, ctx, dispatch.type, mention.message, {
-          description: entry.description,
-          reclaim: { handle: entry.handle, alias: entry.alias, id: entry.id },
-          resumeSessionFile: tombSessionFile,
-          isBackground: true,
-        });
-        // The agent may still be starting — wait, so a startup failure lands in
-        // the catch below instead of being announced as a resume.
-        await manager.awaitStartup(id);
-        // The tombstone deliberately stays. `resolveMention` prefers the live
-        // record holding these same names, so it cannot shadow the resume — and
-        // if this run dies before establishing its own session, the original
-        // transcript is still the right thing for the next mention to reopen.
-        // Once the resumed record is evicted it overwrites this entry in place,
-        // keyed by the same handle, so nothing accumulates.
-        ctx.ui.notify(`Resuming ${target}`, "info");
-      } catch (err) {
-        // The type is already settled above, so what is left is a spawn-time
-        // failure: a strict worktree-isolation error, an unusable cwd.
-        ctx.ui.notify(
-          `Could not resume ${target}: ${err instanceof Error ? err.message : String(err)}`,
-          "warning",
-        );
+      if (record.sessionFile || record.outputFile) {
+        // The record says there WAS a conversation and it is no longer on disk
+        // (a `/new` in another window, a manual delete). Starting a brand-new
+        // agent instead would quietly answer a follow-up about work this agent
+        // did, so say what happened and let the user decide.
+        ctx.ui.notify(`Could not resume ${target} — its session is gone.`, "warning");
+        return { action: "handled" };
       }
-      return { action: "handled" };
-      } // end else: sessionFile の無い tombstone は上の if で落として新規開始へ
+      // Nothing on disk either — like a record that never got far enough to
+      // continue. Falls through to the start-fresh path below (Claude Code's
+      // `no_transcript`).
     }
 
     // No agent under that handle — but the name may still be an agent type, in
@@ -1353,6 +1384,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_before_switch", () => {
     manager.clearCompleted(true);
     scheduler.stop();
+    stopArchiveSweep();
   });
 
   // On shutdown, abort all agents immediately and clean up.
@@ -1370,6 +1402,7 @@ export default function (pi: ExtensionAPI) {
       delete (globalThis as any)[MANAGER_KEY];
     }
     scheduler.stop();
+    stopArchiveSweep();
     // Before abortAll, and not folded into it: a workflow owns a worker thread
     // as well as its children, and only its own signal terminates that.
     for (const task of workflowTasks.values()) task.abortController.abort();
@@ -1519,6 +1552,53 @@ export default function (pi: ExtensionAPI) {
           sendIndividualNudge(record);
         }
       }
+    }
+  }
+
+  /**
+   * Reopen a finished agent's conversation from its file on disk.
+   *
+   * An ordinary spawn carrying a session file — so the new record picks up the
+   * widget, fleet row, transcript and completion notification unchanged — with
+   * `reclaim` handing it back the names and id the finished agent held, so a
+   * conversation keeps a stable identity across reopens.
+   *
+   * `spawnResolved`, not `spawnTopLevel`: the latter strips `resumeSessionFile`
+   * and `reclaim` as untrusted, and both here come from a session file this
+   * extension either wrote or located inside its own session dir.
+   *
+   * Returns `undefined` on success and a failure reason otherwise — the two
+   * callers (the `@handle` mention and the Agent tool's resume) report it in
+   * their own words. The type is resolved from the agent's own definition and
+   * the generic fallback is REFUSED: reopening a conversation under another
+   * agent's prompt and tools is not continuing it.
+   */
+  async function reopenFromDisk(
+    ctx: ExtensionContext,
+    agent: { id: string; type: SubagentType; handle?: string; alias?: string; description: string },
+    sessionFile: string,
+    prompt: string,
+  ): Promise<string | undefined> {
+    reloadCustomAgents();
+    const dispatch = resolveSpawnType(agent.type);
+    if (!dispatch.ok || dispatch.fellBackFrom !== undefined) {
+      // Re-enabling the agent makes the resume work again; a failure here must
+      // not discard the record that still holds the conversation.
+      return `the ${agent.type} agent is no longer available`;
+    }
+    try {
+      const id = spawnResolved(pi, ctx, dispatch.type, prompt, {
+        description: agent.description,
+        reclaim: { handle: agent.handle, alias: agent.alias, id: agent.id },
+        resumeSessionFile: sessionFile,
+        isBackground: true,
+      });
+      // Wait, so a startup failure (a strict worktree error, an unusable cwd)
+      // is reported as one instead of being announced as a resume.
+      await manager.awaitStartup(id);
+      return undefined;
+    } catch (err) {
+      return err instanceof Error ? err.message : String(err);
     }
   }
 
@@ -2207,130 +2287,122 @@ Terse command-style prompts produce shallow, generic work.
         }
       }
 
-      // Resume existing agent (exact id, handle/alias, unique id prefix, disk session, or tombstone)
+      /**
+       * Spawn a detached reopen of a conversation found on disk and render the
+       * tool's answer. Shared by the two disk lookups below, so both report the
+       * same shape. A spawn-time failure (a strict worktree error, an unusable
+       * cwd) is a start failure, not "Agent not found".
+       */
+      const openFromDisk = (
+        type: string,
+        sessionFile: string,
+        description: string,
+        reclaim?: { handle?: string; alias?: string; id?: string },
+      ) => {
+        let spawnedId: string;
+        try {
+          spawnedId = spawnResolved(pi, ctx, type, params.prompt, {
+            description,
+            resumeSessionFile: sessionFile,
+            reclaim,
+            isBackground: true,
+            model,
+            thinkingLevel: thinking,
+            maxTurns: effectiveMaxTurns,
+            isolated,
+            isolation,
+          });
+        } catch (err) {
+          return textResult(`Agent failed to start from disk: "${params.resume}". ${err instanceof Error ? err.message : String(err)}`);
+        }
+        const rec = manager.getRecord(spawnedId);
+        const isQueued = rec?.status === "queued";
+        return textResult(
+          `Agent ${isQueued ? "queued" : "resumed"} from disk in background.\n` +
+          `Agent ID: ${spawnedId}\n` +
+          `Type: ${type}\n` +
+          (rec?.outputFile ? `Output file: ${rec.outputFile}\n` : "") +
+          (isQueued ? `Position: queued (max ${manager.getMaxConcurrent()} concurrent)\n` : "") +
+          `\nYou will be notified when this agent completes.\n` +
+          `Use get_subagent_result to retrieve full results, or steer_subagent to send it messages.`,
+          rec ? { ...detailBaseFor(rec), toolUses: rec.toolUses, tokens: "", durationMs: 0, status: "background" as const, agentId: spawnedId } : undefined,
+        );
+      };
+
+      // Resume existing agent. Two lookup stages, in order of fidelity:
+      //   (1) memory — resolveRecord handles id, handle/alias and a unique id
+      //       prefix. A record whose live session the sweep already released is
+      //       still a memory hit: it names the conversation's file, so the
+      //       resume reopens that instead of answering "no active session".
+      //   (2) disk — findSessionOnDisk covers the session dir, archive/ and a
+      //       session rebuilt from a `.output` transcript, which is what keeps
+      //       an agent reachable after its record is gone (24h retention, a
+      //       session switch, or a fresh process).
       if (params.resume) {
         const existing = manager.resolveRecord(params.resume);
         if (!existing || !isTopLevelAgent(existing)) {
-          // raw パス受付の fence 用: この拡張が記録したセッション dir と、
-          // 把握済みのセッションファイル集合 (live + tombstone) のみ信頼する。
+          // raw パス受付の fence 用: この拡張が把握済みのセッションファイル
+          // 集合（live レコードの分）のみ信頼する。
           const knownSessionFiles = new Set<string>();
           for (const rec of manager.listAgents()) {
             if (rec.sessionFile) knownSessionFiles.add(rec.sessionFile);
-          }
-          for (const tomb of manager.listTombstones()) {
-            if (tomb.sessionFile) knownSessionFiles.add(tomb.sessionFile);
           }
           const diskMatch = await findSessionOnDisk(ctx.cwd, params.resume, {
             sessionDir: ctx.sessionManager?.getSessionDir?.(),
             knownFiles: knownSessionFiles,
           });
-          // セッションファイルからの reopen 元。解決順序: (1) disk 上の pi セッション
-          // （live dir＋archive/ 走査）、(2) tombstone（完了後10分のGCでメモリ
-          // レコードが消えた後も残る。tombstone はディスク永続化されセッションを
-          // 跨いで保持される。上限 MAX_TOMBSTONES=1000、セッション境界での全消去なし）。
-          // (2) は `@handle` メンション経路の reclaim＋resumeSessionFile と同等の処理で、
-          // 新規レコードとして復活させる。
-          let reopen: { sessionFile: string; resolvedType: string; description: string; reclaim?: { handle: string; alias?: string; id?: string } } | undefined;
           if (diskMatch && existsSync(diskMatch.path)) {
             reloadCustomAgents();
             const dispatch = resolveSpawnType(diskMatch.type);
-            // tombstone＝メンション経路の拒否規約に揃える: 別エージェントでの
-            // reopen は会話の継続にならないため、型を解決できない場合は
-            // fallback せず Agent not found に落とす (disk 側の従来 fallback を廃止)。
+            // The Agent tool deliberately falls back to general-purpose for an
+            // unresolvable type (#183). A resume must not inherit that:
+            // reopening under a different agent's prompt and tools is not
+            // continuing the conversation, so it falls to `Agent not found`.
             if (dispatch.ok && dispatch.fellBackFrom === undefined) {
-              // disk 上のセッションが tombstone 遺留のものと同一なら handle を
-              // 取り戻す (同一性は sessionFile で判定)。tombstone は残す:
-              // live レコードが resolveMention で優先されるため影にならず、
-              // 次回 evict 時に同 handle で上書きされる。
-              const reclaimed = manager.listTombstones().find(t => t.sessionFile === diskMatch.path);
-              reopen = {
-                sessionFile: diskMatch.path,
-                resolvedType: dispatch.type,
-                description: params.description ?? diskMatch.name ?? `Resumed ${dispatch.type}`,
-                reclaim: reclaimed ? { handle: reclaimed.handle, alias: reclaimed.alias, id: reclaimed.id } : undefined,
-              };
-            }
-          } else {
-            const mentionResolved = manager.resolveMention(params.resume);
-            if (mentionResolved?.kind === "tombstone") {
-              const entry = mentionResolved.entry;
-              // archive 移動済みでも reopen できるよう解決してから存在判定する。
-              const tombSessionFile = resolveTombstoneSessionFile(entry, ctx.sessionManager?.getSessionDir?.());
-              if (!tombSessionFile) {
-                // メンション経路と同様、復活不能な tombstone は落とす。
-                // エラーメッセージは従来通り下の `Agent not found` を返す。
-                manager.dropTombstone(entry.handle);
-              } else {
-                reloadCustomAgents();
-                const tombDispatch = resolveSpawnType(entry.type);
-                // disk 経路の fallback とは違い、別エージェントでの reopen は会話の
-                // 継続にならないため受け付けない (メンション経路と同様)。tombstone は
-                // 残す: エージェントの再有効化で handle が再び使えるようになる。
-                if (tombDispatch.ok && tombDispatch.fellBackFrom === undefined) {
-                  reopen = {
-                    sessionFile: tombSessionFile,
-                    resolvedType: tombDispatch.type,
-                    description: params.description ?? entry.description,
-                    reclaim: { handle: entry.handle, alias: entry.alias, id: entry.id },
-                  };
-                }
-              }
+              return openFromDisk(
+                dispatch.type,
+                diskMatch.path,
+                params.description ?? diskMatch.name ?? `Resumed ${dispatch.type}`,
+              );
             }
           }
-          if (reopen) {
-            // メンション経路と同等に: 型解決済みでも worktree strict 等の
-            // spawn 時失敗は throw するため、Agent not found ではなく起動失敗
-            // として返す。
-            let spawnedId: string;
-            try {
-              spawnedId = spawnResolved(pi, ctx, reopen.resolvedType, params.prompt, {
-                description: reopen.description,
-                resumeSessionFile: reopen.sessionFile,
-                reclaim: reopen.reclaim,
-                isBackground: true,
-                model,
-                thinkingLevel: thinking,
-                maxTurns: effectiveMaxTurns,
-                isolated,
-                isolation,
-              });
-            } catch (err) {
-              return textResult(`Agent failed to start from disk: "${params.resume}". ${err instanceof Error ? err.message : String(err)}`);
-            }
-
-            const rec = manager.getRecord(spawnedId);
-            const isQueued = rec?.status === "queued";
-            return textResult(
-              `Agent ${isQueued ? "queued" : "resumed"} from disk in background.\n` +
-              `Agent ID: ${spawnedId}\n` +
-              `Type: ${reopen.resolvedType}\n` +
-              (rec?.outputFile ? `Output file: ${rec.outputFile}\n` : "") +
-              (isQueued ? `Position: queued (max ${manager.getMaxConcurrent()} concurrent)\n` : "") +
-              `\nYou will be notified when this agent completes.\n` +
-              `Use get_subagent_result to retrieve full results, or steer_subagent to send it messages.`,
-              rec ? { ...detailBaseFor(rec), toolUses: rec.toolUses, tokens: "", durationMs: 0, status: "background" as const, agentId: spawnedId } : undefined,
-            );
-          }
-
           return textResult(`Agent not found: "${params.resume}". It may have been cleaned up.`);
         }
-        if (!existing.session) {
-          return textResult(`Agent "${params.resume}" has no active session to resume.`);
-        }
 
-        // Resume reapplies the effective model onto the live session: an explicit
-        // `model` wins, otherwise the agent file's model — symmetric with
-        // `thinking` below, which always reapplies. Without this the previous
-        // run's model would stick.
-        // Note: frontmatter は existing.type から読む。resume は `subagent_type`
-        // を無視するため resolvedConfig（= params.subagent_type 由来）ではない。
-        // 拒否判定が先: setModel は transcript に model_change を追記して走行中
-        // run のプロンプトキャッシュを壊すため、still running で resume できない
-        // 場合にモデルを触ってはならない（manager.resume の拒否と同条件）。
+        // Steering only. `manager.resume` refuses a running/queued record too,
+        // but the rejection has to happen BEFORE any setModel — a model change
+        // appends a model_change entry to the transcript and breaks the prompt
+        // cache of the run that is still going.
         if (existing.status === "running" || existing.status === "queued") {
           return textResult(
             `Agent "${params.resume}" is still ${existing.status} — it can only be resumed once its current run finishes.\n` +
             `Use steer_subagent to send it a message mid-run, or get_subagent_result to wait for it.`,
+          );
+        }
+
+        // Finished, and its live session was released by the sweep. The
+        // conversation is on disk (session file, archive/ sibling, or a session
+        // rebuilt from the `.output` transcript), so reopen it there.
+        if (!existing.session) {
+          const diskFile = resolveSessionFileOnDisk(
+            existing,
+            ctx.sessionManager?.getSessionDir?.(),
+            ctx.cwd,
+          );
+          if (!diskFile) {
+            return textResult(`Agent "${params.resume}" has no session to resume.`);
+          }
+          reloadCustomAgents();
+          const dispatch = resolveSpawnType(existing.type);
+          if (!dispatch.ok || dispatch.fellBackFrom !== undefined) {
+            return textResult(`Agent "${params.resume}" can no longer be resumed: the ${existing.type} agent is not available.`);
+          }
+          return openFromDisk(
+            dispatch.type,
+            diskFile,
+            // eslint-disable-next-line
+            params.description ?? existing.description,
+            { handle: existing.handle, alias: existing.alias, id: existing.id },
           );
         }
         const resumeModelError = await applyResumeModel({

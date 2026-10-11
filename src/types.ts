@@ -135,33 +135,13 @@ export type ResultDisplayMode = 'full' | 'collapsed';
 export type AgentMentionMode = 'model' | 'direct' | 'off';
 
 /**
- * What survives a record's eviction so `@handle` keeps working. The live record
- * is discarded after ~10 minutes, but the pi session it wrote is still on disk,
- * and this is the little that is needed to find and describe it again.
- */
-export interface AgentTombstone {
-  handle: string;
-  alias?: string;
-  id: string;
-  type: SubagentType;
-  description: string;
-  /**
-   * pi セッションファイル。GC 時の tombstone 化は sessionFile の有無を問わず
-   * 行うため、未永続セッション（in-memory）の tombstone では undefined になる。
-   * undefined の tombstone は会話の reopen 不可（resume 経路は sessionFile
-   * 必須）が、ハンドル保持と一覧可視のため残す。ディスク永続化の対象でもある。
-   */
-  sessionFile?: string;
-  completedAt: number;
-}
-
-/**
- * What `@handle` resolved to: an agent still in memory, or the remains of one
- * whose conversation can be reopened from disk.
+ * What `@handle` resolved to: an agent still in memory (running, or finished
+ * with a session, or finished with only its file on disk), or a name that is an
+ * agent type and can be started.
  */
 export type MentionResolution =
   | { kind: "live"; record: AgentRecord }
-  | { kind: "tombstone"; entry: AgentTombstone };
+  | { kind: "type"; type: SubagentType };
 
 export interface AgentRecord {
   id: string;

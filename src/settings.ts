@@ -1,9 +1,10 @@
 // Persistence for pi-subagents operational settings.
-// - Global:  ~/.pi/agent/subagents.json (via getAgentDir()) — manual defaults, never written here
+// - Global:  ~/.pi/agent/subagents.json (via getAgentDir()) — manual defaults, and where a
+//   save made from the home directory lands (see isGlobalPiRoot).
 // - Project: <cwd>/.pi/subagents.json — written by /agents → Settings; overrides global on load
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { NO_FALLBACK } from "./agent-types.js";
 import type { AgentMentionMode, JoinMode, ResultDisplayMode, ViewerMarkdownMode, WidgetMode } from "./types.js";
@@ -423,6 +424,30 @@ function globalPath(): string {
   return join(getAgentDir(), "subagents.json");
 }
 
+/**
+ * True when `<cwd>/.pi` IS the global agent dir's own parent (`~/.pi`), i.e.
+ * the user ran pi from their home directory. `projectPath(cwd)` then returns
+ * `~/.pi/subagents.json`, which is not a project-scoped file but another file
+ * sitting next to the global one — and because project values override global
+ * ones on load, a stale write there silently shadows every manual default in
+ * `<agentDir>/subagents.json`. `rememberAgents: false` left in that spot is
+ * exactly how every subagent ended up on `SessionManager.inMemory()`:
+ * records with no `sessionFile`, hence no way back to their transcripts.
+ *
+ * Only this exact identity counts: a real project's `.pi` (or any other
+ * directory) keeps its own file. Compared case-insensitively after
+ * normalization because Windows paths differ in case by origin.
+ */
+function isGlobalPiRoot(cwd: string): boolean {
+  try {
+    return resolve(cwd, ".pi").toLowerCase() === resolve(getAgentDir(), "..").toLowerCase();
+  } catch {
+    // getAgentDir() throwing here is unreachable in practice; if it ever
+    // happens, treating the cwd as a project is the historical behaviour.
+    return false;
+  }
+}
+
 function projectPath(cwd: string): string {
   return join(cwd, ".pi", "subagents.json");
 }
@@ -443,18 +468,28 @@ function readSettingsFile(path: string): SubagentsSettings {
   }
 }
 
-/** Load merged settings: global provides defaults, project overrides. */
+/**
+ * Load merged settings: global provides defaults, project overrides.
+ *
+ * A cwd whose `.pi` is the global agent dir's parent (running pi from `~`) is
+ * not a project: it has no project file of its own, and reading one there
+ * would let a leftover file override the user's global defaults — see
+ * {@link isGlobalPiRoot}. In that case global is the only scope.
+ */
 export function loadSettings(cwd: string = process.cwd()): SubagentsSettings {
+  if (isGlobalPiRoot(cwd)) return readSettingsFile(globalPath());
   return { ...readSettingsFile(globalPath()), ...readSettingsFile(projectPath(cwd)) };
 }
 
 /**
- * Write project-local settings. Global is never touched from code.
- * Returns `true` on success, `false` if the write (or mkdir) failed so the
- * caller can surface a warning — persistence isn't fatal but isn't silent.
+ * Write settings, normally to the project file. The one exception is the
+ * home-directory case {@link isGlobalPiRoot} covers: a "project" file at
+ * `~/.pi/subagents.json` is a shadow of the global one, so a save made from
+ * there goes to `<agentDir>/subagents.json` instead — otherwise the next load
+ * would read it straight back as an override.
  */
 export function saveSettings(s: SubagentsSettings, cwd: string = process.cwd()): boolean {
-  const path = projectPath(cwd);
+  const path = isGlobalPiRoot(cwd) ? globalPath() : projectPath(cwd);
   try {
     mkdirSync(dirname(path), { recursive: true });
     writeFileSync(path, JSON.stringify(s, null, 2), "utf-8");

@@ -216,8 +216,10 @@ describe("readArchiveConfig", () => {
     writeFileSync(path, content, "utf8");
   }
 
-  it("returns undefined when no settings file carries the section", () => {
-    expect(readArchiveConfig(projectDir!)).toBeUndefined();
+  it("defaults to enabled at 24h when no settings file carries the section", () => {
+    // Archiving is the safe default: the alternative is a session dir that only
+    // ever grows. Opting out has to be explicit.
+    expect(readArchiveConfig(projectDir!)).toEqual({ enabled: true, maxAgeHours: 24 });
   });
 
   it("reads enabled with the default maxAgeHours", () => {
@@ -238,11 +240,44 @@ describe("readArchiveConfig", () => {
     expect(readArchiveConfig(projectDir!)).toEqual({ enabled: false, maxAgeHours: 24 });
   });
 
-  it("treats an unreadable or non-object section as absent", () => {
+  it("only an explicit false turns it off", () => {
+    // `"off"`, 0, null are not booleans — the sweep stays on rather than being
+    // disabled by a value nobody meant as a switch.
+    writeSettings("global", JSON.stringify({ "session-archive": { enabled: "off" } }));
+    expect(readArchiveConfig(projectDir!)).toEqual({ enabled: true, maxAgeHours: 24 });
+    writeSettings("global", JSON.stringify({ "session-archive": { enabled: 0 } }));
+    expect(readArchiveConfig(projectDir!)).toEqual({ enabled: true, maxAgeHours: 24 });
+  });
+
+  it("honors project over global for the enabled flag too", () => {
+    writeSettings("global", JSON.stringify({ "session-archive": { enabled: false } }));
+    writeSettings("project", JSON.stringify({ "session-archive": { enabled: true } }));
+    expect(readArchiveConfig(projectDir!)).toEqual({ enabled: true, maxAgeHours: 24 });
+
+    writeSettings("project", JSON.stringify({ "session-archive": { enabled: false } }));
+    writeSettings("global", JSON.stringify({ "session-archive": { enabled: true } }));
+    expect(readArchiveConfig(projectDir!)).toEqual({ enabled: false, maxAgeHours: 24 });
+  });
+
+  it("falls back to the default age for a nonsense maxAgeHours", () => {
+    writeSettings("global", JSON.stringify({ "session-archive": { maxAgeHours: 0 } }));
+    expect(readArchiveConfig(projectDir!)).toEqual({ enabled: true, maxAgeHours: 24 });
+    writeSettings("global", JSON.stringify({ "session-archive": { maxAgeHours: -5 } }));
+    expect(readArchiveConfig(projectDir!)).toEqual({ enabled: true, maxAgeHours: 24 });
+    writeSettings("global", JSON.stringify({ "session-archive": { maxAgeHours: "soon" } }));
+    expect(readArchiveConfig(projectDir!)).toEqual({ enabled: true, maxAgeHours: 24 });
+  });
+
+  it("treats an unreadable or non-object section as the default, not as off", () => {
     writeSettings("global", "{ not json");
-    expect(readArchiveConfig(projectDir!)).toBeUndefined();
+    expect(readArchiveConfig(projectDir!)).toEqual({ enabled: true, maxAgeHours: 24 });
 
     writeSettings("global", JSON.stringify({ "session-archive": "off" }));
-    expect(readArchiveConfig(projectDir!)).toBeUndefined();
+    expect(readArchiveConfig(projectDir!)).toEqual({ enabled: true, maxAgeHours: 24 });
+
+    // A corrupt project file does not cancel a usable global one either.
+    writeSettings("global", JSON.stringify({ "session-archive": { maxAgeHours: 48 } }));
+    writeSettings("project", "{ not json");
+    expect(readArchiveConfig(projectDir!)).toEqual({ enabled: true, maxAgeHours: 48 });
   });
 });

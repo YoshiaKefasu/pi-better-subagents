@@ -10,17 +10,17 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { isAbsolute, join } from "node:path";
+import { statSync } from "node:fs";
+import { isAbsolute } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
-import { type AgentSession, type ExtensionAPI, type ExtensionContext, getAgentDir } from "@earendil-works/pi-coding-agent";
+import { type AgentSession, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
 import { assignHandle, handleBase } from "./mention.js";
 import { isUpstreamUnreachableError, isUsageLimitError } from "./model-fallback-chain.js";
 import { describeModel } from "./model-resolver.js";
 import { dropNestedTodos } from "./nested-todos.js";
 import { loadSubagentsRetrySettings, type SubagentsRetrySettings } from "./subagents-retry-settings.js";
-import type { AgentInvocation, AgentRecord, AgentTombstone, IsolationMode, MentionResolution, SubagentType, ThinkingLevel } from "./types.js";
+import type { AgentInvocation, AgentRecord, IsolationMode, MentionResolution, SubagentType, ThinkingLevel } from "./types.js";
 import { addUsage, type LifetimeUsage } from "./usage.js";
 import type { CompiledSchema } from "./workflow/json-schema.js";
 import { cleanupWorktree, createWorktree, isWorktreeIsolationEnabled, pruneWorktrees, } from "./worktree.js";
@@ -51,24 +51,31 @@ export type CompactionInfo = { reason: "manual" | "threshold" | "overflow"; toke
 const DEFAULT_MAX_CONCURRENT = 10;
 
 /**
- * How many evicted agents stay addressable by name. Raised from 100 to 1000:
- * a tombstone is a few hundred bytes of JSON (handle/alias/id/type/
- * sessionFile/completedAt) and now also lives on disk, so holding a thousand
- * costs ~100KB and survives session switches. The bound still exists so one
- * runaway session cannot grow memory or the tombstone file without limit —
- * see the unbounded-growth note in README (Session archive) before raising it.
+ * How long a finished record stays in memory after its run ended.
+ *
+ * Long, because a record is the only thing that answers `@handle` and
+ * `Agent({ resume })` from memory: the conversation itself lives on disk
+ * (`.jsonl`, `archive/` after 24h idle, `.output` as a last resort), so a
+ * record is a cache, not the source of truth. 24h matches the archive window —
+ * by the time archiving would consider a transcript stale, its record is gone
+ * too, and a resume then goes straight to the files on disk.
+ *
+ * At {@link SESSION_DETACH_AFTER_MS} the live `session` object is shut down and
+ * detached, so what stays in memory for those 24 hours is a small record
+ * (ids, names, counts, timestamps, two file paths) rather than a whole agent
+ * session. Resuming such a record reopens the file — see `spawnResolved`.
  */
-const MAX_TOMBSTONES = 1000;
+const RECORD_RETAIN_MS = 24 * 60 * 60_000;
 
 /**
- * Fork-owned tombstone store, next to pi's own agent-dir files. Resolved via
- * the existing `getAgentDir()` so tests (PI_CODING_AGENT_DIR) and real runs
- * agree on the location. Deleted records are never removed from here except
- * by explicit drop/clear or oldest-first cap eviction — never by GC or by a
- * session switch — so a completed agent's conversation stays reopenable.
- * ディスク増加は緩やか: tombstone 1件は数百バイト、1000件でも ~100KB 程度。
+ * How long a finished record keeps its live `session` object. The session is
+ * what holds the extension runner and the message array, so it is the
+ * expensive half; the record's own bookkeeping is not. Ten minutes is long
+ * enough for anything that reads the record right after completion (results,
+ * widgets, steering) and short enough that an idle session stops paying for
+ * sessions it will never touch again.
  */
-const TOMBSTONE_FILE_NAME = "subagent-tombstones.json";
+const SESSION_DETACH_AFTER_MS = 10 * 60_000;
 
 /**
  * Validate a caller-supplied SpawnOptions.cwd. `undefined`/`null` mean "unset"
@@ -149,8 +156,8 @@ interface SpawnOptions {
    * Take an evicted agent's names back verbatim instead of allocating fresh
    * ones, so a resumed conversation keeps the handle the user just typed —
    * `handleBase(type)` cannot reproduce a numbered `explore-2`. Safe without an
-   * `assignHandle` pass because tombstoned names are excluded from allocation
-   * (`takenHandles`), so nothing live can be holding them.
+   * `assignHandle` pass because no live record holds them: this is used when
+   * reopening a finished agent, which by definition is not running.
    *
    * `id` reuses the evicted record's ID so a resumed conversation keeps a
    * stable identity. Reused only when no live record holds it (see `spawn`);
@@ -623,19 +630,6 @@ export class AgentManager {
   private startups = new Map<string, Promise<void>>();
 
   /**
-   * Evicted agents that can still be reached by name, keyed by handle. Outlives
-   * the 10-minute record cleanup — that timer exists to bound memory, not to
-   * expire a conversation the user might still want — and is KEPT across
-   * session start/switch: the store is mirrored to disk
-   * (`subagent-tombstones.json` under the agent dir), so an evicted agent
-   * stays reopenable in later sessions. Only explicit drops (dropTombstone /
-   * clearTombstones) or oldest-first cap eviction remove entries.
-   */
-  private tombstones = new Map<string, AgentTombstone>();
-  /** Disk mirror enabled via enableTombstonePersistence() (extension only). */
-  private tombstonePersistence = false;
-
-  /**
    * Agents waiting to start. One queue for the single pool: `drainQueue` starts
    * the earliest entry while a background slot is free.
    */
@@ -655,11 +649,10 @@ export class AgentManager {
     this.onCompact = onCompact;
     this.onUsage = onUsage;
     this.maxConcurrent = maxConcurrent;
-    // NOTE: the disk mirror is NOT loaded here. Persistence is opt-in via
-    // enableTombstonePersistence() (the extension calls it; unit tests stay
-    // purely in-memory unless they opt in) so a bare manager can never read
-    // or write the developer's real store as a test side effect.
-    // Cleanup completed agents after 10 minutes (but keep sessions for resume)
+    // Reaps finished records on a one-minute cadence (never per message): it
+    // detaches a completed run's session after 10 minutes and drops the record
+    // after 24 hours. Both are memory bounds — nothing on disk expires with
+    // them, and a resume picks the conversation back up from its file.
     this.cleanupInterval = setInterval(() => this.cleanup(), 60_000);
     this.cleanupInterval.unref();
   }
@@ -701,12 +694,10 @@ export class AgentManager {
     // can fix and retry; the RPC layer converts throws into error envelopes.
     assertValidSpawnCwd(options.cwd);
 
-    // ID再利用: tombstone resume / disk reopen は会話ファイルを開き直した
-    // 新規レコードとして復活するため、復活元のIDを reclaim.id で引き継いで
-    // 会話の同一性を保つ。現存レコードと衝突する場合（同IDが生きている）は
-    // 従来通り新規採番する — ID重複は絶対に起こさない。tombstone は live
-    // レコードではないため再利用を妨げない（resume 成功後も tombstone は残る
-    // 仕様だが、id 解決は live の map のみ見るので衝突しない）。
+    // ID再利用: disk reopen は会話ファイルを開き直した新規レコードとして
+    // 復活するため、復活元のIDを reclaim.id で引き継いで会話の同一性を保つ。
+    // 現存レコードと衝突する場合（同IDが生きている）は従来通り新規採番する —
+    // ID重複は絶対に起こさない。
     // startedAt 等の実行メタは下の record 構築で常に新規にする — 引き継ぐのは
     // ID だけであり、実行状態（result/error/completedAt 等）は持ち越さない。
     const reclaimedId = options.reclaim?.id;
@@ -965,6 +956,10 @@ export class AgentManager {
     const promise = runAgent(ctx, type, prompt, {
       pi,
       agentId: id,
+      // The on-disk identity, so a finished agent is reachable by handle and
+      // alias as well as id once its record is gone from memory.
+      handle: record.handle,
+      alias: record.alias,
       model: options.model,
       modelFallbacks: options.modelFallbacks,
       maxTurns: options.maxTurns,
@@ -1744,13 +1739,6 @@ export class AgentManager {
       if (record.handle) taken.add(record.handle);
       if (record.alias) taken.add(record.alias);
     }
-    // Tombstones hold their names too: an evicted `@explore` is still
-    // resurrectable, so a later Explore must become `explore-2` rather than
-    // shadowing a conversation the user can still reach.
-    for (const entry of this.tombstones.values()) {
-      taken.add(entry.handle);
-      if (entry.alias) taken.add(entry.alias);
-    }
     return taken;
   }
 
@@ -1759,6 +1747,11 @@ export class AgentManager {
    * case-insensitively, preferring one that can still be steered and otherwise
    * the most recently started (which is the one a resume should continue), then
    * falls back to an exact agent id so `@<agentId>` works too.
+   *
+   * An id also matches by a unique prefix (≥ {@link MIN_ID_PREFIX_LEN} chars),
+   * the same rule `resolveRecord` and the on-disk session search apply, so a
+   * short id from a completion notification names the same agent everywhere.
+   * Ambiguous prefixes are refused rather than guessed.
    */
   resolveMention(name: string): MentionResolution | undefined {
     const wanted = name.toLowerCase();
@@ -1774,35 +1767,18 @@ export class AgentManager {
     if (fallback) return { kind: "live", record: fallback };
     const byId = this.agents.get(name);
     if (byId?.parentAgentId === undefined && byId !== undefined) return { kind: "live", record: byId };
-    // Only once nothing live answers: a tombstone is a conversation to reopen,
-    // and reopening one while its record still exists would fork the session.
-    for (const entry of this.tombstones.values()) {
-      if (entry.handle.toLowerCase() === wanted || entry.alias?.toLowerCase() === wanted || entry.id === name) {
-        return { kind: "tombstone", entry };
+    if (wanted.length < MIN_ID_PREFIX_LEN) return undefined;
+    let match: AgentRecord | undefined;
+    for (const record of this.agents.values()) {
+      // Nested children have no handle and are not addressable from a top-level
+      // surface, so a prefix that happens to hit one must not resolve to it.
+      if (record.parentAgentId !== undefined) continue;
+      if (record.id.toLowerCase().startsWith(wanted)) {
+        if (match) return undefined; // ambiguous
+        match = record;
       }
     }
-    return undefined;
-  }
-
-  /**
-   * Forget an evicted agent, by handle. For the case where its session file has
-   * gone: the entry can then only ever fail, while still holding the name
-   * against the type that would otherwise start a fresh agent under it.
-   *
-   * A *successful* resume does not drop its tombstone — the live record it
-   * creates already wins in `resolveMention`, and overwrites the entry in place
-   * when it is itself evicted.
-   */
-  dropTombstone(handle: string): void {
-    this.tombstones.delete(handle);
-    // tombstone と同一キーで保持していた ToDo もここで破棄する。
-    dropNestedTodos(handle);
-    this.persistTombstones();
-  }
-
-  /** Evicted agents whose conversation can still be reopened, newest first. */
-  listTombstones(): AgentTombstone[] {
-    return [...this.tombstones.values()].sort((a, b) => b.completedAt - a.completedAt);
+    return match ? { kind: "live", record: match } : undefined;
   }
 
   listAgents(): AgentRecord[] {
@@ -1832,13 +1808,18 @@ export class AgentManager {
     return true;
   }
 
-  /** Dispose a record's session and remove it from the map. */
+  /**
+   * Dispose a record's session and remove it from the map.
+   *
+   * Nothing is preserved here: the conversation already lives on disk (the pi
+   * session file, its `archive/` sibling after 24h idle, and the `.output`
+   * transcript), so a resume that arrives later reopens it from there rather
+   * than from a second in-memory copy of the same bookkeeping.
+   */
   private removeRecord(id: string, record: AgentRecord): void {
-    this.tombstone(record);
-    // tombstone 化されなかったレコード（handle の無い nested/workflow 子等）の
-    // ToDo は後段の破棄点が無いのでここで破棄する。tombstone 化された側は
-    // handle キーのまま生き残り、tombstone 破棄時に連動して消える。
-    if (!record.handle) dropNestedTodos(record.id);
+    // The record is the last holder of its ToDo store — anything still keyed by
+    // this handle/id has nothing left to report into.
+    dropNestedTodos(record.handle ?? record.id);
     const session = record.session;
     // Detached before the shutdown starts, so the record leaves the map at once and
     // nothing can observe a session that is half torn down.
@@ -1854,138 +1835,64 @@ export class AgentManager {
   }
 
   /**
-   * Preserve enough of a departing record for `@handle` to reopen its
-   * conversation later. Every record WITH a handle is kept — including one
-   * whose session was never persisted (`sessionFile` undefined): such an entry
-   * cannot be reopened (the resume paths require a session file), but it still
-   * holds the name against shadowing and stays visible in the evicted list, so
-   * GC never silently discards a finished agent. Records without a handle
-   * (nested/workflow children) have nothing anyone could address them by, so
-   * there is nothing to keep — those return without writing.
+   * Release a finished record's live session object while keeping the record.
+   *
+   * The session is the expensive half of a finished agent (extension runner,
+   * full message array, stream subscriptions); the record is a few fields.
+   * Dropping the session at ten minutes bounds what an idle session costs,
+   * and loses nothing: `record.sessionFile` / `record.outputFile` still name
+   * the conversation, which is what a resume reopens.
    */
-  private tombstone(record: AgentRecord): void {
-    if (!record.handle) return;
-    this.tombstones.set(record.handle, {
-      handle: record.handle,
-      alias: record.alias,
-      id: record.id,
-      type: record.type,
-      description: record.description,
-      sessionFile: record.sessionFile,
-      completedAt: record.completedAt ?? Date.now(),
-    });
-    // Bound the memory a long session can accumulate. Oldest first, since the
-    // agent someone still wants to reach is the one they used most recently.
-    while (this.tombstones.size > MAX_TOMBSTONES) {
-      const oldest = [...this.tombstones.values()].reduce((a, b) => (a.completedAt <= b.completedAt ? a : b));
-      this.tombstones.delete(oldest.handle);
-      // 上限追い出し: tombstone と同一キーで保持していた ToDo も破棄する。
-      dropNestedTodos(oldest.handle);
-    }
-    this.persistTombstones();
+  private detachSession(record: AgentRecord): void {
+    const session = record.session;
+    record.session = undefined;
+    void shutdownChildSession(session);
   }
 
   /**
-   * Enable the disk mirror of tombstones (`subagent-tombstones.json` under
-   * the agent dir): reloads entries persisted by an earlier process, then
-   * persists on every later mutation. Called once by the extension right after
-   * construction — a bare manager stays purely in-memory, so unit tests never
-   * touch the developer's real store unless they opt in explicitly.
+   * Two memory bounds on finished records, on the minute:
+   *
+   *   - past {@link SESSION_DETACH_AFTER_MS}, the live session object is shut
+   *     down and detached. The record stays — it is cheap and still answers
+   *     `@handle`, steering and resumes — and reopening happens from
+   *     `record.sessionFile` / `record.outputFile`.
+   *   - past {@link RECORD_RETAIN_MS}, the record itself goes. By then the
+   *     conversation has been on disk for a day and archiving owns it; a later
+   *     resume finds the `.jsonl` (live or under `archive/`) or rebuilds one
+   *     from the `.output` transcript.
+   *
+   * Running and queued records are never touched, however old they look: a
+   * live agent's session being disposed mid-run is the worst failure this
+   * guard prevents, and `completedAt` on a running record is meaningless.
    */
-  enableTombstonePersistence(): void {
-    this.tombstonePersistence = true;
-    // Disk-persisted tombstones outlive the process: reload them so a restart
-    // or a new activation keeps every evicted agent reopenable. A corrupt
-    // file reads as empty (never a startup failure) — see loadTombstones.
-    this.loadTombstones();
-  }
-
-  /** Fork-owned tombstone file: `<agentDir>/subagent-tombstones.json`. */
-  private tombstoneFile(): string | undefined {
-    try {
-      return join(getAgentDir(), TOMBSTONE_FILE_NAME);
-    } catch {
-      return undefined;
-    }
-  }
-
-  /**
-   * Best-effort mirror of the in-memory tombstones to disk. Called after every
-   * mutation (add, cap eviction, drop, clear) so a crash or a session switch
-   * never loses an evicted agent. Sync and small (≤1000 tiny entries) — this
-   * runs on eviction paths only, never per message. Failures are swallowed: a
-   * tombstone store that cannot be written must not take down the session.
-   * No-op unless enableTombstonePersistence() was called, so unit-test
-   * managers stay off disk.
-   */
-  private persistTombstones(): void {
-    if (!this.tombstonePersistence) return;
-    const file = this.tombstoneFile();
-    if (!file) return;
-    try {
-      mkdirSync(join(getAgentDir()), { recursive: true });
-      writeFileSync(file, JSON.stringify([...this.tombstones.values()]), "utf-8");
-    } catch {
-      /* best-effort — memory still holds the entries for this process */
-    }
-  }
-
-  /**
-   * Reload tombstones persisted by an earlier process. Shape-validated field
-   * by field; anything unreadable, unparseable, or misshapen reads as empty —
-   * a corrupt store must never fail startup. Entries past the cap are dropped
-   * oldest-first, same as the live eviction order.
-   */
-  private loadTombstones(): void {
-    const file = this.tombstoneFile();
-    if (!file || !existsSync(file)) return;
-    try {
-      const raw: unknown = JSON.parse(readFileSync(file, "utf-8"));
-      if (!Array.isArray(raw)) return;
-      const loaded: AgentTombstone[] = [];
-      for (const item of raw) {
-        if (typeof item !== "object" || item === null) continue;
-        const rec = item as Record<string, unknown>;
-        if (typeof rec.handle !== "string" || typeof rec.id !== "string") continue;
-        if (typeof rec.completedAt !== "number") continue;
-        loaded.push({
-          handle: rec.handle,
-          alias: typeof rec.alias === "string" ? rec.alias : undefined,
-          id: rec.id,
-          type: typeof rec.type === "string" ? (rec.type as AgentTombstone["type"]) : "general-purpose",
-          description: typeof rec.description === "string" ? rec.description : "",
-          sessionFile: typeof rec.sessionFile === "string" ? rec.sessionFile : undefined,
-          completedAt: rec.completedAt,
-        });
-      }
-      loaded.sort((a, b) => b.completedAt - a.completedAt);
-      for (const entry of loaded.slice(0, MAX_TOMBSTONES)) {
-        this.tombstones.set(entry.handle, entry);
-      }
-    } catch {
-      /* corrupt file — start empty, the next persist overwrites it */
-    }
-  }
-
   private cleanup() {
-    const cutoff = Date.now() - 10 * 60_000;
+    const now = Date.now();
+    const detachCutoff = now - SESSION_DETACH_AFTER_MS;
+    const retainCutoff = now - RECORD_RETAIN_MS;
     for (const [id, record] of this.agents) {
       if (record.status === "running" || record.status === "queued") continue;
-      if ((record.completedAt ?? 0) >= cutoff) continue;
+      const completedAt = record.completedAt ?? 0;
+      if (completedAt >= retainCutoff) {
+        // Guarded on the session itself, not just the age: a detached record
+        // keeps being visited every minute for 24 hours, and `detachSession`
+        // would call shutdownChildSession(undefined) each time for nothing.
+        if (record.session && completedAt < detachCutoff) this.detachSession(record);
+        continue;
+      }
       this.removeRecord(id, record);
     }
   }
 
   /**
-   * Remove all completed/stopped/errored records immediately. Evicted records
-   * are tombstoned (and persisted) as usual, and tombstones are KEPT across
-   * the call: both callers are session boundaries (`session_start` and
-   * `session_before_switch`), and since tombstones went durable an evicted
-   * agent stays reopenable in the next session. Pass skipUnconsumed=true to
-   * preserve records the LLM hasn't read yet (resultConsumed=false) — they
-   * will be evicted by the 10-minute cleanup timer instead.
+   * Drop every finished record from memory now. Both callers are session
+   * boundaries (`session_start`, `session_before_switch`): the next session has
+   * its own agents, so carrying these across would only leak their names and
+   * bookkeeping into it. Nothing is lost — each conversation is already on disk
+   * (`.jsonl`, `archive/` after 24h idle, `.output` transcript), and a resume
+   * by id, handle or alias reopens it from there.
    *
-   * 明示の削除は dropTombstone（1件）/ clearTombstones（全件）を使うこと。
+   * Pass skipUnconsumed=true to preserve records the LLM hasn't read yet
+   * (resultConsumed=false); the cleanup timer will reap them instead.
    */
   clearCompleted(skipUnconsumed = false): void {
     for (const [id, record] of this.agents) {
@@ -1993,22 +1900,6 @@ export class AgentManager {
       if (skipUnconsumed && !record.resultConsumed) continue;
       this.removeRecord(id, record);
     }
-    // tombstone は消さない: セッション切替・/new での無条件全消去をやめ、
-    // ディスク永続化した tombstone はセッションを跨いで保持する。生き残り
-    // レコード（running/queued、skipUnconsumed で温存された分）の ToDo と、
-    // 保持される tombstone 配下の ToDo には触らない。
-  }
-
-  /**
-   * Forget every evicted agent, by explicit request. The only path that wipes
-   * tombstones in bulk — GC, session switches, and `/new` deliberately keep
-   * them (see clearCompleted). Drops the linked nested ToDos and persists the
-   * now-empty store.
-   */
-  clearTombstones(): void {
-    for (const handle of this.tombstones.keys()) dropNestedTodos(handle);
-    this.tombstones.clear();
-    this.persistTombstones();
   }
 
   /** Whether any agents are still running or queued. */

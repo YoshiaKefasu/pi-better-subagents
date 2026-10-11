@@ -1006,17 +1006,23 @@ describe("resuming an evicted agent by name", () => {
   afterEach(() => vi.useRealTimers());
 
   /**
-   * Age the record past the cutoff and let the real GC evict it. The session
-   * file has to exist on disk: the dispatcher refuses to resume one it cannot
-   * find, so a fictional path would take the "session is gone" branch and
-   * every resume assertion below would pass for the wrong reason.
+   * Age a finished record and let the real GC run. Two stages, so `minutes`
+   * picks one:
+   *   - ≥ 10 minutes: the live session is released, the record stays (so the
+   *     resume below is still a memory hit that reopens from disk),
+   *   - ≥ 24 hours: the record is reaped and only the files remain.
+   *
+   * The session file has to exist on disk when `keepFile` is not false: the
+   * dispatcher refuses to resume one it cannot find, so a fictional path would
+   * take the "session is gone" branch and every resume assertion below would
+   * pass for the wrong reason.
    */
-  async function evict(id: string) {
+  async function evict(id: string, minutes = 11, keepFile = true) {
     const manager = (globalThis as any)[Symbol.for("pi-subagents:manager")];
     const record = manager.getRecord(id);
     record.sessionFile = sessionPath();
-    writeFileSync(record.sessionFile, "");
-    record.completedAt = Date.now() - 11 * 60_000;
+    if (keepFile) writeFileSync(record.sessionFile, "");
+    record.completedAt = Date.now() - minutes * 60_000;
     await vi.advanceTimersByTimeAsync(60_000);
     return manager;
   }
@@ -1030,7 +1036,10 @@ describe("resuming an evicted agent by name", () => {
     const id = await spawnBackground(tools);
     await flush();
     const manager = await evict(id);
-    expect(manager.getRecord(id)).toBeUndefined();
+    // Not evicted — detached: the record stays for 24h with its live session
+    // released, and the resume reopens the file the record names.
+    expect(manager.getRecord(id)).toBeDefined();
+    expect(manager.getRecord(id).session).toBeUndefined();
     vi.mocked(runAgent).mockClear();
 
     const uiCtx = ctx();
@@ -1146,7 +1155,7 @@ describe("resuming an evicted agent by name", () => {
 
     expect(vi.mocked(runAgent)).not.toHaveBeenCalled();
     expect(uiCtx.ui.notify).toHaveBeenCalledWith(
-      "Could not resume @scout — the scout agent is no longer available.", "warning",
+      "Could not resume @scout — the scout agent is no longer available", "warning",
     );
   });
 
@@ -1243,7 +1252,9 @@ describe("resuming an evicted agent by name", () => {
     // tombstone and act on stale data.
     const { tools } = boot();
     finishedRun(fakeSession());
-    await evict(await spawnBackground(tools));
+    // Past the 24h retention: the record itself is gone, so the tools have
+    // nothing to resolve — only the files on disk, which they do not read.
+    await evict(await spawnBackground(tools), 25 * 60);
     await flush();
 
     const steered = await tools.get("steer_subagent").execute(
@@ -1281,9 +1292,12 @@ describe("resuming an evicted agent by name", () => {
     );
   });
 
-  it("forgets an unopenable session so the next mention starts fresh", async () => {
-    // A row that can only ever fail is worse than no row: it holds the handle
-    // and refuses every message sent to it.
+  it("keeps reporting an unopenable session instead of silently starting fresh", async () => {
+    // The record knows a conversation existed and cannot find it, so every
+    // mention is refused rather than quietly answered by a brand-new agent
+    // that has none of the context the message assumes. The record holds the
+    // name for its 24h retention window and then goes; a mention after that
+    // starts fresh, which is the honest reading of "there is nothing here".
     const { lifecycle, tools } = bootDirect();
     finishedRun(fakeSession());
     await evict(await spawnBackground(tools));
@@ -1291,7 +1305,6 @@ describe("resuming an evicted agent by name", () => {
     unlinkSync(sessionPath());
     await send(lifecycle, "@explore anything else?");
     vi.mocked(runAgent).mockClear();
-    heldRun(fakeSession());
 
     const uiCtx = ctx();
     await lifecycle.get("input")(
@@ -1300,11 +1313,10 @@ describe("resuming an evicted agent by name", () => {
     );
     await flush();
 
-    expect(vi.mocked(runAgent)).toHaveBeenCalledWith(
-      expect.anything(), "Explore", "start over",
-      expect.not.objectContaining({ resumeSessionFile: expect.anything() }),
+    expect(vi.mocked(runAgent)).not.toHaveBeenCalled();
+    expect(uiCtx.ui.notify).toHaveBeenCalledWith(
+      "Could not resume @explore — its session is gone.", "warning",
     );
-    expect(uiCtx.ui.notify).toHaveBeenCalledWith("Started @explore", "info");
   });
 });
 

@@ -32,6 +32,12 @@ import { getAgentDir } from "@earendil-works/pi-coding-agent";
 export const ARCHIVE_DIR_NAME = "archive";
 /** Default idle age (hours) after which a subagent session is archivable. */
 export const DEFAULT_ARCHIVE_AGE_HOURS = 24;
+/**
+ * Archiving is on unless a settings file says `"enabled": false`. Sessions are
+ * the one thing a subagent leaves behind that cannot be regenerated, so the
+ * safe default is the one that stores them.
+ */
+export const DEFAULT_ARCHIVE_ENABLED = true;
 
 const HOUR_MS = 60 * 60 * 1000;
 
@@ -99,20 +105,27 @@ function readArchiveSection(path: string): Record<string, unknown> | undefined {
 /**
  * Read the `session-archive` section from pi settings — project overrides
  * global per field, matching pi's own SettingsManager precedence.
- * Returns undefined when neither file carries the section (the caller then
- * does nothing); `enabled` defaults to false and `maxAgeHours` to
- * {@link DEFAULT_ARCHIVE_AGE_HOURS}.
+ *
+ * Always answers: archiving is on by default ({@link DEFAULT_ARCHIVE_ENABLED}), so a
+ * project that never mentions `session-archive` gets stale subagent
+ * transcripts swept into `archive/` just like one that asked for it. Only an
+ * explicit `"enabled": false` turns it off — the setting exists to be
+ * switched off, and a missing file must not silently disable a feature whose
+ * whole job is keeping the live session dir small.
+ *
+ * `maxAgeHours` falls back to {@link DEFAULT_ARCHIVE_AGE_HOURS} for anything that
+ * is not a positive number (absent, 0, negative, or nonsense), so the sweep
+ * always has a usable window.
  */
-export function readArchiveConfig(cwd: string): SessionArchiveConfig | undefined {
+export function readArchiveConfig(cwd: string): SessionArchiveConfig {
   const [project, global] = settingsPaths(cwd);
   const globalSection = readArchiveSection(global);
   const projectSection = readArchiveSection(project);
-  if (!globalSection && !projectSection) return undefined;
   const section = { ...(globalSection ?? {}), ...(projectSection ?? {}) };
   const maxAgeHours = typeof section.maxAgeHours === "number" && section.maxAgeHours > 0
     ? section.maxAgeHours
     : DEFAULT_ARCHIVE_AGE_HOURS;
-  return { enabled: section.enabled === true, maxAgeHours };
+  return { enabled: section.enabled !== false, maxAgeHours };
 }
 
 /**
