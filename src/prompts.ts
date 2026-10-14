@@ -11,6 +11,17 @@ export interface PromptExtras {
   /** Preloaded skill contents to inject. */
   skillBlocks?: { name: string; content: string }[];
   /**
+   * Magic Context's `<project-memory>` pinboard for the project this agent runs
+   * in — read straight from `context.db` by `buildProjectMemoryBlock`.
+   *
+   * This is the one section that has to reach a `replace`-mode agent: its prompt
+   * is built without the parent's system prompt, so the parent's own
+   * `<project-memory>` never arrives, and neither does anything a sibling
+   * subagent pinned with `ctx_memory` after the parent prompt was assembled.
+   * Injected in both modes so every subagent starts from the same pinboard.
+   */
+  projectMemoryBlock?: string;
+  /**
    * Parent directory the worktree copy was created from. Set only for
    * `isolation: "worktree"` spawns — triggers the block that tells the agent
    * to stay in the copy.
@@ -41,6 +52,10 @@ export interface PromptExtras {
  * - "replace" mode: env header + config.systemPrompt (full control, no parent identity)
  * - "append" mode: parent system prompt + sub-agent context + env header + config.systemPrompt
  * - "append" with empty systemPrompt: pure parent clone
+ *
+ * `extras.projectMemoryBlock` is the exception to "replace discards the parent":
+ * it is appended in both modes, because a replaced prompt has no other channel
+ * through which the project's pinned facts can arrive.
  *
  * Both modes include an `<active_agent name="${config.name}"/>` tag so downstream
  * extensions (e.g. permission/policy systems) can resolve per-agent policy
@@ -90,6 +105,12 @@ Return only the answer, in exactly the shape the prompt asks for — no preamble
   const extraSections: string[] = [];
   if (extras?.memoryBlock) {
     extraSections.push(extras.memoryBlock);
+  }
+  // Project memory is mode-independent (see PromptExtras.projectMemoryBlock) and
+  // sits with the other inherited context, after per-agent memory and before
+  // preloaded skills.
+  if (extras?.projectMemoryBlock) {
+    extraSections.push(extras.projectMemoryBlock);
   }
   if (extras?.skillBlocks?.length) {
     for (const skill of extras.skillBlocks) {

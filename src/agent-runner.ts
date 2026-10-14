@@ -28,6 +28,7 @@ import { classifyRetryFailure, isAuthUnavailable, isUpstreamUnreachableError, is
 import { describeModel, resolveModel } from "./model-resolver.js";
 import { buildTodoNudgePrompt, createNestedTodoTool, getUnfinishedTodos, resolveNestedTodoKey } from "./nested-todos.js";
 import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager } from "./nested-tools.js";
+import { buildProjectMemoryBlock } from "./project-memory.js";
 import { buildAgentPrompt, type PromptExtras } from "./prompts.js";
 import { preloadSkills } from "./skill-loader.js";
 import { createStructuredCapture, createStructuredOutputTool, structuredRetryPrompt } from "./structured-output.js";
@@ -703,6 +704,12 @@ export async function runAgent(
   const extras: PromptExtras = {};
   if (options.worktreeBase) extras.worktreeBase = options.worktreeBase;
   if (options.workflow && !options.structuredOutput) extras.workflowChild = true;
+
+  // Magic Context project memory. Read fresh on every spawn so a memory a
+  // sibling subagent pinned minutes ago is already in this agent's prompt —
+  // a `replace`-mode custom agent has no other route to it, since it never
+  // receives the parent system prompt.
+  extras.projectMemoryBlock = buildProjectMemoryBlock(configCwd);
 
   // Resolve extensions/skills: isolated overrides to false
   const extensions = options.isolated ? false : config.extensions;
