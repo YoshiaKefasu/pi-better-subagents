@@ -44,6 +44,14 @@ export interface PromptExtras {
    * `get_subagent_result` — so terse raw data would be the wrong answer there.
    */
   workflowChild?: boolean;
+  /**
+   * True when the runner injected the `ask_user` tool into this session (a
+   * non-isolated top-level child). Only then does the prompt tell the agent to
+   * ask the parent session instead of guessing: isolated runs, grandchildren
+   * and the main session never get the tool, and telling them to call it would
+   * be an instruction they cannot follow.
+   */
+  askUserTool?: boolean;
 }
 
 /**
@@ -101,6 +109,12 @@ Return only the answer, in exactly the shape the prompt asks for — no preamble
 </workflow_child>`
     : "";
 
+  // Ask the parent instead of guessing — but only for agents that actually
+  // carry the ask_user tool (see PromptExtras.askUserTool).
+  const askUserInstruction = extras?.askUserTool
+    ? "確認事項、方針の選択、判断が必要な場合は、推測や独断で進めずに必ず `ask_user` ツールを使って親セッションに質問すること。質問後は親からの回答が届くまで待機状態になる"
+    : "";
+
   // Build optional extras suffix
   const extraSections: string[] = [];
   if (extras?.memoryBlock) {
@@ -133,6 +147,7 @@ You are operating as a sub-agent invoked to handle a specific task.
 - Use absolute file paths
 - Do not use emojis
 - Be concise but complete
+${askUserInstruction ? `\n- ${askUserInstruction}` : ""}
 </sub_agent_context>`;
 
     const customSection = config.systemPrompt?.trim()
@@ -151,7 +166,7 @@ You are operating as a sub-agent invoked to handle a specific task.
   const replaceHeader = `You are a pi coding agent sub-agent.
 You have been invoked to handle a specific task autonomously.
 
-${envBlock}`;
+${envBlock}${askUserInstruction ? `\n\n${askUserInstruction}` : ""}`;
 
   return activeAgentTag + replaceHeader + worktreeBlock + workflowBlock + "\n\n" + config.systemPrompt + extrasSuffix;
 }

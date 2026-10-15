@@ -19,6 +19,7 @@ import {
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getConfig, getMemoryToolNames, getReadOnlyMemoryToolNames, getToolNamesForType } from "./agent-types.js";
+import { clearAskUserWaiting, createAskUserTool, isAskUserWaiting, waitForAskUserAnswer } from "./ask-user.js";
 import { runInChildSessionContext } from "./child-context.js";
 import { buildParentContext, extractText } from "./context.js";
 import { DEFAULT_AGENTS } from "./default-agents.js";
@@ -711,6 +712,17 @@ export async function runAgent(
   // receives the parent system prompt.
   extras.projectMemoryBlock = buildProjectMemoryBlock(configCwd);
 
+  // Whether this session gets the `ask_user` tool. Top-level children only
+  // (depth 1, the main session's own agent): a grandchild is bound by its own
+  // contract to return its result to its parent AGENT, and that parent is
+  // mid-turn — it cannot answer a question, so the run would park forever.
+  // The same flag gates the prompt instruction below, so an agent is never told
+  // to use a tool it does not have (isolated runs and grandchildren included).
+  const askUserAvailable = options.nestedRuntime !== undefined
+    && !options.isolated
+    && options.nestedRuntime.depth <= 1;
+  if (askUserAvailable) extras.askUserTool = true;
+
   // Resolve extensions/skills: isolated overrides to false
   const extensions = options.isolated ? false : config.extensions;
   // Nulling excludes under isolated also suppresses the orphaned-exclude warning —
@@ -997,6 +1009,38 @@ export async function runAgent(
     : [];
   const todoToolNames = new Set(todoTools.map(tool => tool.name));
 
+  // Parent-session questions (ask_user). Same opt-out as the todo tool
+  // (`disallowed_tools`), but with a depth gate — see `askUserAvailable` above:
+  // only a top-level child may ask the parent session. The question goes to the
+  // parent as a steer notification, and the runner's loop parks the agent in
+  // the waiting state until an answer arrives (via steer_subagent) — see the
+  // ask-user gate in the prompt loop below.
+  const askUserRuntime = askUserAvailable ? options.nestedRuntime : undefined;
+  const askUserTools = askUserRuntime
+    ? [createAskUserTool({
+        manager: askUserRuntime.manager,
+        parentAgentId: askUserRuntime.parentAgentId,
+        onQuestion: (question) => {
+          // Notify the parent session (main agent / user) in real time.
+          // options.pi is the root session's ExtensionAPI, so the message lands
+          // in the main session no matter how deep this agent is nested.
+          const record = askUserRuntime.manager.getRecord?.(askUserRuntime.parentAgentId);
+          const agentLabel = record?.handle ?? record?.alias ?? record?.type ?? askUserRuntime.parentAgentId;
+          const agentId = record?.id ?? askUserRuntime.parentAgentId;
+          options.pi.sendMessage({
+            customType: "subagent-notification",
+            content:
+              `[質問 / Confirmation Required]\n` +
+              `サブエージェント ${agentLabel} から確認・質問が届きました：\n\n${question}\n\n` +
+              `回答を送るには steer_subagent ツールを使用してください：\n` +
+              `steer_subagent(agent_id: "${agentId}", message: "回答内容")`,
+            display: true,
+          }, { deliverAs: "steer", triggerTurn: true });
+        },
+      })]
+    : [];
+  const askUserToolNames = new Set(askUserTools.map(tool => tool.name));
+
   // The `agent({ schema })` contract: this child reports its answer by calling
   // StructuredOutput, and `structuredJson` below is what the caller reads. The
   // schema was already compiled by whoever asked for it, so a bad one failed
@@ -1017,6 +1061,7 @@ export async function runAgent(
   const readmitToolNames = new Set([
     ...[...nestedToolNames].filter(name => !disallowedSet?.has(name)),
     ...[...todoToolNames].filter(name => !disallowedSet?.has(name)),
+    ...[...askUserToolNames].filter(name => !disallowedSet?.has(name)),
     ...structuredToolNames,
   ]);
 
@@ -1061,6 +1106,8 @@ export async function runAgent(
       ...[...nestedToolNames].filter((t) => !disallowedSet?.has(t)),
       // The private todo tool rides the same opt-out as the nested tools.
       ...[...todoToolNames].filter((t) => !disallowedSet?.has(t)),
+      // The question tool rides the same opt-out as the todo tool.
+      ...[...askUserToolNames].filter((t) => !disallowedSet?.has(t)),
       // Not filtered through `disallowedSet`, unlike the nested tools above:
       // the caller asked for a schema, and removing the only tool that can
       // satisfy it would make the request unsatisfiable by construction rather
@@ -1130,7 +1177,7 @@ export async function runAgent(
     ...(parentModelRuntime !== undefined && { modelRuntime: parentModelRuntime as never }),
     model,
     tools: sessionTools,
-    customTools: [...nestedTools, ...todoTools, ...structuredTools],
+    customTools: [...nestedTools, ...todoTools, ...askUserTools, ...structuredTools],
     resourceLoader: loader,
   };
   if (sessionExcludeTools) {
@@ -1266,6 +1313,16 @@ export async function runAgent(
   let ownRetryCount = 0;
   // 未完了 ToDo リマインドの送出回数（MAX_TODO_NUDGES で上限）。
   let todoNudgeCount = 0;
+  // nested セッションの ToDo/ask_user 保持キー（handle ?? id）。ask_user の
+  // 待機状態も同じキーで引くため、ループの外で一度だけ解決する。
+  const nestedRecordForKey = options.nestedRuntime
+    ? options.nestedRuntime.manager.getRecord?.(options.nestedRuntime.parentAgentId)
+    : undefined;
+  const nestedTodoKey = options.nestedRuntime
+    ? nestedRecordForKey
+      ? resolveNestedTodoKey(nestedRecordForKey)
+      : options.nestedRuntime.parentAgentId
+    : undefined;
   try {
     for (;;) {
       try {
@@ -1288,6 +1345,27 @@ export async function runAgent(
         lastThrown = err;
       }
 
+      // ask_user 質問待機ゲート（structured 再送・ToDo リマインドより前に置く）。
+      // 子が親へ質問中のときは、リマインドで「早帰り」と誤判定して作業を
+      // 続行させるわけにはいかない — 未完了 ToDo があってもナッジをスキップし、
+      // 回答を待つ。回答は steer_subagent 経由で待機 Promise に届き、
+      // そのまま次ターンのプロンプトとして再開する。
+      if (
+        failure === undefined &&
+        nestedTodoKey !== undefined &&
+        !softLimitReached && !aborted &&
+        isAskUserWaiting(nestedTodoKey)
+      ) {
+        let answer: string;
+        try {
+          answer = await waitForAskUserAnswer(nestedTodoKey, options.signal);
+        } catch {
+          // 中断（AbortSignal 発火・待機解除）: クリーンに待機を外して抜ける。
+          break;
+        }
+        promptToSend = answer;
+        continue;
+      }
       // One more prompt when a schema was asked for and nothing usable came back
       // — the model answered in prose, or only ever called the tool invalidly.
       // Inside this `try`, so the turn tracking, the text collector and above all
@@ -1302,16 +1380,16 @@ export async function runAgent(
       }
       // 未完了 ToDo を残したまま終わろうとした子エージェントは同一セッションで続行させる。
       // structuredOutput リトライの後、通常 break の直前（成功時のみ・中断時は送らない）。
+      // 質問待機中は上のゲートで answer を待つため、ここには来ない。
       if (
         failure === undefined &&
         options.nestedRuntime &&
+        nestedTodoKey !== undefined &&
         !softLimitReached &&
         !aborted && options.signal?.aborted !== true &&
         todoNudgeCount < MAX_TODO_NUDGES
       ) {
-        const record = options.nestedRuntime.manager.getRecord?.(options.nestedRuntime.parentAgentId);
-        const todoKey = record ? resolveNestedTodoKey(record) : options.nestedRuntime.parentAgentId;
-        const unfinished = getUnfinishedTodos(todoKey);
+        const unfinished = getUnfinishedTodos(nestedTodoKey);
         if (unfinished.length > 0) {
           todoNudgeCount++;
           promptToSend = buildTodoNudgePrompt(unfinished);
@@ -1398,6 +1476,11 @@ export async function runAgent(
     unsubTurns();
     collector.unsubscribe();
     cleanupAbort();
+    // 質問待機が残ったまま抜けた経路の掃除（soft limit 到達・中断でゲートを
+    // 飛ばした等）。待機 Promise は reject され、エントリも消える。
+    if (nestedTodoKey !== undefined && isAskUserWaiting(nestedTodoKey)) {
+      clearAskUserWaiting(nestedTodoKey);
+    }
   }
   // throw で終わった試行が最後なら従来通り reject する（manager の .catch 経路）。
   // own-retry待機中のabortは failure/lastThrown を残したまま抜けるが成功扱いにせず投げもしない。

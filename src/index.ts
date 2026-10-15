@@ -22,6 +22,7 @@ import { AgentManager, isTopLevelAgent } from "./agent-manager.js";
 import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, getRememberAgents, normalizeMaxTurns, resolveEffectiveMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, setRememberAgents, steerAgent } from "./agent-runner.js";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, getConfig, getFallbackSubagent, isDefaultsDisabled, NO_FALLBACK, registerAgents, resolveSpawnType, resolveType, setDefaultsDisabled, setFallbackSubagent } from "./agent-types.js";
 import { persistArchiveConfig } from "./archive-settings.js";
+import { deliverAskUserAnswer, isAskUserWaiting } from "./ask-user.js";
 import { inChildSessionContext } from "./child-context.js";
 import { type RpcHandle, registerRpcHandlers } from "./cross-extension-rpc.js";
 import { loadCustomAgents } from "./custom-agents.js";
@@ -32,6 +33,7 @@ import { runMentionClone } from "./mention-clone.js";
 import { parseModelChain } from "./model-fallback-chain.js";
 import { describeModel, type ModelRegistry, resolveModel } from "./model-resolver.js";
 import { checkModelScope, isScopeModelsEnabled, setScopeModelsEnabled } from "./model-scope.js";
+import { resolveNestedTodoKey } from "./nested-todos.js";
 import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
 import { createOutputFilePath, ensureOutputFile, findOutputFile, getOutputTranscriptDefault, materializeSessionFromOutputFile, sessionTaskDir, setOutputTranscriptDefault, streamToOutputFile, writeInitialEntry } from "./output-file.js";
 import { SubagentScheduler } from "./schedule.js";
@@ -3105,7 +3107,8 @@ Terse command-style prompts produce shallow, generic work.
     label: "Steer Agent",
     description:
       "Send a steering message to a running agent. The message will interrupt the agent after its current tool execution " +
-      "and be injected into its conversation, allowing you to redirect its work mid-run. Only works on running agents.",
+      "and be injected into its conversation, allowing you to redirect its work mid-run. Only works on running agents. " +
+      "If the agent is waiting for an answer to an ask_user question, this message is delivered as the answer and the agent resumes.",
     promptSnippet: "Send a steering message to redirect a running background agent",
     parameters: Type.Object({
       agent_id: Type.String({
@@ -3122,6 +3125,19 @@ Terse command-style prompts produce shallow, generic work.
       }
       if (record.status !== "running") {
         return textResult(`Agent "${params.agent_id}" is not running (status: ${record.status}). Cannot steer a non-running agent.`);
+      }
+      // 質問待機中（ask_user）のエージェントへは steer ではなく「回答」として届ける。
+      // 待機 Promise を解決して次ターンのプロンプトとして再開させる（session.steer は
+      // 使わない — 割り込む先のツール実行が無いためキューに積まるだけになる）。
+      // エントリが消えていた（abort で解放済み等）場合は通常の steer にフォールバック。
+      {
+        const todoKey = resolveNestedTodoKey(record);
+        if (isAskUserWaiting(todoKey) && deliverAskUserAnswer(todoKey, params.message)) {
+          pi.events.emit("subagents:steered", { id: record.id, message: params.message });
+          return textResult(
+            `Steering message sent to agent ${record.id} as answer to its pending question. The agent is resuming work.`,
+          );
+        }
       }
       if (!record.session) {
         // Session not ready yet — queue the steer for delivery once initialized

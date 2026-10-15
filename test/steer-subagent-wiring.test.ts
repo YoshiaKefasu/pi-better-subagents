@@ -13,7 +13,7 @@
  * tested: they are single-line guards whose failure is immediately visible in
  * the tool's own reply.
  */
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../src/agent-runner.js", async () => {
   const actual = await vi.importActual<typeof import("../src/agent-runner.js")>("../src/agent-runner.js");
@@ -21,6 +21,7 @@ vi.mock("../src/agent-runner.js", async () => {
 });
 
 import { runAgent, steerAgent } from "../src/agent-runner.js";
+import { clearAskUserWaiting, createAskUserTool, isAskUserWaiting, waitForAskUserAnswer } from "../src/ask-user.js";
 import subagentsExtension from "../src/index.js";
 import { ctx, flush, makePi, textOf } from "./helpers/boot-extension.js";
 
@@ -125,6 +126,50 @@ describe("steer_subagent before the session exists", () => {
     expect(steerAgent).not.toHaveBeenCalled();
 
     await lifecycle.get("session_shutdown")?.();
+  });
+});
+
+describe("steer_subagent delivering an ask_user answer", () => {
+  // A question from a subagent is answered THROUGH the steer tool: the waiting
+  // Promise is resolved and the answer becomes the agent's next prompt. The
+  // session is never steered — there is no tool call in flight to interrupt.
+  it("resolves the waiting Promise and reports it as an answer", async () => {
+    const { pi, tools, lifecycle } = makePi();
+    subagentsExtension(pi);
+    heldRun();
+
+    const id = await spawnBackground(tools);
+    await flush();
+
+    // A fresh manager gives this first top-level spawn its type name as the
+    // handle, and `handle ?? id` is the ask_user key.
+    const key = "general-purpose";
+    const askTool = createAskUserTool({
+      manager: { getRecord: () => ({ id: key, handle: key }) } as any,
+      parentAgentId: key,
+      onQuestion: () => {},
+    });
+    await askTool.execute("tc-ask", { question: "A案とB案、どちらにしますか？" } as never, undefined, undefined, {} as never);
+    expect(isAskUserWaiting(key)).toBe(true);
+
+    const result = await steer(tools, id, "B案で");
+    expect(textOf(result)).toContain("as answer to its pending question");
+    expect(textOf(result)).toContain("The agent is resuming work.");
+    // The answer travels the Promise, not the session — steerAgent must stay idle.
+    expect(steerAgent).not.toHaveBeenCalled();
+    expect(pi.events.emit).toHaveBeenCalledWith("subagents:steered", { id, message: "B案で" });
+
+    // The runner consumes the answer as its next prompt (no waiter yet, so it
+    // is parked in the entry until the loop asks for it).
+    expect(isAskUserWaiting(key)).toBe(true);
+    expect(await waitForAskUserAnswer(key)).toBe("B案で");
+    expect(isAskUserWaiting(key)).toBe(false);
+
+    await lifecycle.get("session_shutdown")?.();
+  });
+
+  afterEach(() => {
+    clearAskUserWaiting("general-purpose");
   });
 });
 

@@ -182,6 +182,39 @@ describe("buildAgentPrompt", () => {
     expect(prompt).toContain("Use the grep tool instead of");
   });
 
+  it("append mode bridge tells the agent to ask instead of guessing — only with the ask_user tool", () => {
+    // ask_user の契約: 判断が必要なら推測や独断で進まず親に質問し、回答を待つ。
+    // 指示はツールを実際に注入したエージェント（depth 1・非 isolated）にしか出さない。
+    const config = getDefaultConfig("general-purpose");
+    const askLine = "推測や独断で進めずに必ず `ask_user` ツールを使って親セッションに質問すること";
+
+    const withTool = buildAgentPrompt(config, "/workspace", env, "Parent prompt.", { askUserTool: true });
+    expect(withTool).toContain(askLine);
+    expect(withTool).toContain("親からの回答が届くまで待機状態になる");
+
+    // 注入無し（isolated / 孫エージェント / メインセッション）では指示を出さない。
+    const without = buildAgentPrompt(config, "/workspace", env, "Parent prompt.");
+    expect(without).not.toContain(askLine);
+  });
+
+  it("replace mode header asks instead of guessing — only with the ask_user tool", () => {
+    const config: AgentConfig = {
+      name: "standalone",
+      description: "Standalone",
+      builtinToolNames: [],
+      extensions: true,
+      skills: true,
+      systemPrompt: "You are a standalone agent.",
+      promptMode: "replace",
+      inheritContext: false,
+      runInBackground: false,
+      isolated: false,
+    };
+    const askLine = "推測や独断で進めずに必ず `ask_user` ツールを使って親セッションに質問すること";
+    expect(buildAgentPrompt(config, "/workspace", env, undefined, { askUserTool: true })).toContain(askLine);
+    expect(buildAgentPrompt(config, "/workspace", env)).not.toContain(askLine);
+  });
+
   it("append mode without parent prompt still has bridge", () => {
     const config: AgentConfig = {
       name: "no-parent",

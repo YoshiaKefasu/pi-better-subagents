@@ -15,6 +15,7 @@ import { isAbsolute } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
 import { type AgentSession, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
+import { clearAskUserWaiting } from "./ask-user.js";
 import { assignHandle, handleBase } from "./mention.js";
 import { isUpstreamUnreachableError, isUsageLimitError } from "./model-fallback-chain.js";
 import { describeModel } from "./model-resolver.js";
@@ -1965,6 +1966,9 @@ export class AgentManager {
     // The record is the last holder of its ToDo store — anything still keyed by
     // this handle/id has nothing left to report into.
     dropNestedTodos(record.handle ?? record.id);
+    // 質問待機（ask_user）も同じキーで保持しているため、ここで解除する。
+    // 残すと runner の待機 Promise とエントリがリークする。
+    clearAskUserWaiting(record.handle ?? record.id);
     const session = record.session;
     // Detached before the shutdown starts, so the record leaves the map at once and
     // nothing can observe a session that is half torn down.
